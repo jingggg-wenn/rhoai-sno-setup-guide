@@ -971,6 +971,38 @@ else
     warn "LWS CRD not ready yet — LeaderWorkerSetOperator CR will be created on next run"
 fi
 
+# Kueue operand CR (requires Kueue operator)
+# The Kueue operator installs via OLM, but its workload CRDs (ClusterQueue,
+# LocalQueue, ResourceFlavor) only register after the Kueue operand CR is
+# created. Without this CR, the entire resource queue setup is skipped.
+if oc get crd kueues.kueue.openshift.io &>/dev/null 2>&1; then
+    if oc get kueue.kueue.openshift.io cluster &>/dev/null 2>&1; then
+        success "Kueue operand CR already exists ✓"
+    else
+        info "Creating Kueue operand CR..."
+        oc apply -f - <<'EOF'
+apiVersion: kueue.openshift.io/v1
+kind: Kueue
+metadata:
+  name: cluster
+spec:
+  managementState: Managed
+EOF
+        success "Kueue operand CR created"
+    fi
+
+    # Wait for Kueue workload CRDs to register
+    info "Waiting for Kueue workload CRDs (ClusterQueue, LocalQueue, ResourceFlavor)..."
+    WAIT=0
+    while ! oc get crd clusterqueues.kueue.x-k8s.io &>/dev/null 2>&1; do
+        [ $WAIT -ge 120 ] && { warn "Kueue CRDs wait timeout (continuing)"; break; }
+        sleep 5; WAIT=$((WAIT + 5))
+    done
+    oc get crd clusterqueues.kueue.x-k8s.io &>/dev/null 2>&1 && success "Kueue workload CRDs registered ✓"
+else
+    warn "Kueue operator CRD not found — install Kueue operator first"
+fi
+
 # Kueue Resource Queues (requires Kueue operator)
 # Creates ResourceFlavors, ClusterQueue, and LocalQueue to enable hardware
 # profile selection and workload scheduling for workbenches / model serving.
@@ -1042,28 +1074,37 @@ EOF
         success "ClusterQueue default created"
     fi
 
-    # LocalQueue in demo namespace (namespace created in Step 3)
+    # LocalQueue in demo namespace and user-* namespaces
     # The default-queue annotation makes it auto-selected for new workloads.
-    if oc get ns demo &>/dev/null 2>&1; then
-        if oc get localqueue default -n demo &>/dev/null 2>&1; then
-            success "LocalQueue default in demo ✓"
-        else
-            oc apply -f - <<'EOF'
+    # Hardware profiles with scheduling.kueue.localQueueName require a matching
+    # LocalQueue in the target namespace, otherwise they appear as invalid.
+    LQ_NAMESPACES="demo"
+    # Add all user-* namespaces (workshop participants)
+    USER_NS=$(oc get namespaces --no-headers 2>/dev/null | awk '{print $1}' | grep '^user-' || true)
+    if [ -n "$USER_NS" ]; then
+        LQ_NAMESPACES="$LQ_NAMESPACES $USER_NS"
+    fi
+
+    for LQ_NS in $LQ_NAMESPACES; do
+        if oc get ns "$LQ_NS" &>/dev/null 2>&1; then
+            if oc get localqueue default -n "$LQ_NS" &>/dev/null 2>&1; then
+                success "LocalQueue default in $LQ_NS ✓"
+            else
+                oc apply -f - <<EOF
 apiVersion: kueue.x-k8s.io/v1beta1
 kind: LocalQueue
 metadata:
   name: default
-  namespace: demo
+  namespace: ${LQ_NS}
   annotations:
     kueue.x-k8s.io/default-queue: "true"
 spec:
   clusterQueue: default
 EOF
-            success "LocalQueue default created in demo"
+                success "LocalQueue default created in $LQ_NS"
+            fi
         fi
-    else
-        warn "demo namespace not found — create it first, then re-run to add LocalQueue"
-    fi
+    done
 else
     warn "Kueue CRDs not ready yet — resource queues will be configured on next run"
 fi
@@ -1503,7 +1544,7 @@ CQ_ACTIVE=$(oc get clusterqueue default \
 [ "$CQ_ACTIVE" = "True" ] && echo "  ✅ ClusterQueue default (Active)" || echo "  ⬚  ClusterQueue default"
 RF_COUNT=$(oc get resourceflavor --no-headers 2>/dev/null | wc -l | tr -d ' ')
 echo "  ✅ ResourceFlavors: $RF_COUNT"
-for NS in demo; do
+for NS in demo $(oc get namespaces --no-headers 2>/dev/null | awk '{print $1}' | grep '^user-' || true); do
     LQ_ACTIVE=$(oc get localqueue default -n "$NS" \
         -o jsonpath='{.status.conditions[?(@.type=="Active")].status}' 2>/dev/null || true)
     [ "$LQ_ACTIVE" = "True" ] && echo "  ✅ LocalQueue default in $NS (Active)" || echo "  ⬚  LocalQueue default in $NS"
