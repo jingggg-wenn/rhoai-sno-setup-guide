@@ -1581,8 +1581,10 @@ else
 
         GPU_MS_NAME="${INFRA_ID}-worker-gpu-${AWS_AZ}"
 
-        if oc get machineset "$GPU_MS_NAME" -n openshift-machine-api &>/dev/null 2>&1; then
-            success "GPU MachineSet $GPU_MS_NAME already exists"
+        if oc get machineset "$GPU_MS_NAME" -n openshift-machine-api &>/dev/null; then
+            CURRENT_REPLICAS=$(oc get machineset "$GPU_MS_NAME" -n openshift-machine-api \
+                -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "?")
+            success "GPU MachineSet $GPU_MS_NAME already exists (replicas=$CURRENT_REPLICAS)"
         else
             info "Creating GPU MachineSet: $GPU_MS_NAME (g6.2xlarge, replicas=0)"
 
@@ -1709,16 +1711,19 @@ echo ""
 ###############################################################################
 info "=== Step 11: GPU Hardware Profile scheduling ==="
 
-if oc get hardwareprofile gpu-profile -n redhat-ods-applications &>/dev/null 2>&1; then
-    # Check if scheduling is already configured
+if oc get hardwareprofile gpu-profile -n redhat-ods-applications &>/dev/null; then
+    # Check if scheduling is already configured correctly
     SCHED_TYPE=$(oc get hardwareprofile gpu-profile -n redhat-ods-applications \
         -o jsonpath='{.spec.scheduling.type}' 2>/dev/null || true)
-    NODE_SEL=$(oc get hardwareprofile gpu-profile -n redhat-ods-applications \
-        -o jsonpath='{.spec.scheduling.node.nodeSelector}' 2>/dev/null || true)
-    TOL_KEY=$(oc get hardwareprofile gpu-profile -n redhat-ods-applications \
-        -o jsonpath='{.spec.scheduling.node.tolerations[0].key}' 2>/dev/null || true)
+    NODE_SEL_GPU=$(oc get hardwareprofile gpu-profile -n redhat-ods-applications \
+        -o jsonpath='{.spec.scheduling.node.nodeSelector.nvidia\.com/gpu\.present}' 2>/dev/null || true)
+    # Check if any toleration matches nvidia.com/gpu (not just index 0)
+    TOL_KEYS=$(oc get hardwareprofile gpu-profile -n redhat-ods-applications \
+        -o jsonpath='{.spec.scheduling.node.tolerations[*].key}' 2>/dev/null || true)
+    HAS_GPU_TOL=false
+    for k in $TOL_KEYS; do [ "$k" = "nvidia.com/gpu" ] && HAS_GPU_TOL=true; done
 
-    if [ "$SCHED_TYPE" = "Node" ] && [ -n "$NODE_SEL" ] && [ "$TOL_KEY" = "nvidia.com/gpu" ]; then
+    if [ "$SCHED_TYPE" = "Node" ] && [ "$NODE_SEL_GPU" = "true" ] && [ "$HAS_GPU_TOL" = "true" ]; then
         success "gpu-profile scheduling already configured (type=Node, toleration + nodeSelector)"
     else
         info "Patching gpu-profile with GPU toleration and nodeSelector..."
