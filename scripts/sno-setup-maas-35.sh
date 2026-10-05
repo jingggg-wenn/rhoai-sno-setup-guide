@@ -165,6 +165,21 @@ if oc get gateway openshift-ai-inference -n openshift-ingress &>/dev/null; then
       }}
     ]' 2>/dev/null && success "Inference gateway: all DS projects allowed" \
                    || warn "Could not patch inference gateway"
+
+    # Fix TLS cert reference — KServe creates the gateway with a non-existent
+    # "default-gateway-tls" secret. Use cert-manager-ingress-cert instead.
+    TLS_REF=$(oc get gateway openshift-ai-inference -n openshift-ingress \
+        -o jsonpath='{.spec.listeners[0].tls.certificateRefs[0].name}' 2>/dev/null)
+    if [ "$TLS_REF" = "default-gateway-tls" ] && \
+       ! oc get secret default-gateway-tls -n openshift-ingress &>/dev/null 2>&1; then
+        info "Fixing inference gateway TLS cert reference..."
+        oc patch gateway openshift-ai-inference -n openshift-ingress --type='json' -p='[
+          {"op":"replace","path":"/spec/listeners/0/tls/certificateRefs","value":[
+            {"group":"","kind":"Secret","name":"cert-manager-ingress-cert"}
+          ]}
+        ]' 2>/dev/null && success "Inference gateway TLS fixed (cert-manager-ingress-cert)" \
+                       || warn "Could not fix inference gateway TLS"
+    fi
 fi
 echo ""
 
