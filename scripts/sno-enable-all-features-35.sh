@@ -1746,6 +1746,146 @@ else
 fi
 echo ""
 
+###############################################################################
+# Step 12: Red Hat OpenShift Dev Spaces
+#   Installs the DevSpaces operator in openshift-operators (same namespace as
+#   Web Terminal to share the DevWorkspace Operator dependency) and creates the
+#   CheCluster CR in openshift-devspaces.
+###############################################################################
+info "=== Step 12: Red Hat OpenShift Dev Spaces ==="
+
+DEVSPACES_OPERATOR_NS="openshift-operators"
+DEVSPACES_NS="openshift-devspaces"
+DEVSPACES_WAIT=300
+
+# --- DevSpaces Operator ---
+if oc get csv -n "$DEVSPACES_OPERATOR_NS" 2>/dev/null | grep -q "devspacesoperator.*Succeeded"; then
+    DS_VER=$(oc get csv -n "$DEVSPACES_OPERATOR_NS" 2>/dev/null | grep "devspacesoperator" | awk '{print $1}')
+    success "DevSpaces operator already installed: $DS_VER"
+else
+    if ! oc get sub devspaces -n "$DEVSPACES_OPERATOR_NS" &>/dev/null; then
+        info "Creating DevSpaces subscription (channel: stable)..."
+        oc apply -f - <<DSEOF
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: devspaces
+  namespace: ${DEVSPACES_OPERATOR_NS}
+spec:
+  channel: stable
+  installPlanApproval: Automatic
+  name: devspaces
+  source: redhat-operators
+  sourceNamespace: openshift-marketplace
+DSEOF
+    fi
+    info "Waiting for DevSpaces CSV..."
+    DS_ELAPSED=0
+    while [ $DS_ELAPSED -lt $DEVSPACES_WAIT ]; do
+        if oc get csv -n "$DEVSPACES_OPERATOR_NS" 2>/dev/null | grep -q "devspacesoperator.*Succeeded"; then
+            success "DevSpaces operator is Succeeded."
+            break
+        fi
+        sleep 10
+        DS_ELAPSED=$((DS_ELAPSED + 10))
+    done
+    if [ $DS_ELAPSED -ge $DEVSPACES_WAIT ]; then
+        warn "DevSpaces CSV not yet Succeeded after ${DEVSPACES_WAIT}s -- it may still be installing."
+    fi
+fi
+
+# --- openshift-devspaces namespace ---
+if ! oc get namespace "$DEVSPACES_NS" &>/dev/null; then
+    info "Creating namespace $DEVSPACES_NS..."
+    oc create namespace "$DEVSPACES_NS"
+else
+    success "Namespace $DEVSPACES_NS already exists."
+fi
+
+# --- CheCluster CR ---
+if oc get checluster devspaces -n "$DEVSPACES_NS" &>/dev/null; then
+    DS_PHASE=$(oc get checluster devspaces -n "$DEVSPACES_NS" \
+        -o jsonpath='{.status.chePhase}' 2>/dev/null || echo "Unknown")
+    success "CheCluster already exists (phase: $DS_PHASE)."
+else
+    info "Creating CheCluster in $DEVSPACES_NS..."
+    oc apply -f - <<'CHEEOF'
+apiVersion: org.eclipse.che/v2
+kind: CheCluster
+metadata:
+  name: devspaces
+  namespace: openshift-devspaces
+spec:
+  components:
+    cheServer:
+      debug: false
+      logLevel: INFO
+    dashboard: {}
+    devWorkspace: {}
+    devfileRegistry: {}
+    imagePuller:
+      enable: false
+    metrics:
+      enable: true
+    pluginRegistry: {}
+  containerRegistry: {}
+  devEnvironments:
+    startTimeoutSeconds: 300
+    secondsOfRunBeforeIdling: -1
+    maxNumberOfWorkspacesPerUser: 5
+    maxNumberOfRunningWorkspacesPerUser: 1
+    containerBuildConfiguration:
+      openShiftSecurityContextConstraint: container-build
+    defaultEditor: che-incubator/che-code/latest
+    defaultComponents:
+    - name: dev-tools
+      container:
+        image: registry.redhat.io/devspaces/udi-rhel8:latest
+        memoryLimit: 4Gi
+        cpuLimit: "2"
+    defaultNamespace:
+      autoProvision: true
+      template: <username>-devspaces
+    security:
+      containerSecurityContext:
+        allowPrivilegeEscalation: true
+        runAsUser: 1234
+    storage:
+      pvcStrategy: per-user
+  gitServices: {}
+  networking: {}
+CHEEOF
+    success "CheCluster CR created."
+fi
+
+# --- Wait for CheCluster Active ---
+DS_PHASE=$(oc get checluster devspaces -n "$DEVSPACES_NS" \
+    -o jsonpath='{.status.chePhase}' 2>/dev/null || true)
+if [ "$DS_PHASE" = "Active" ]; then
+    DS_URL=$(oc get checluster devspaces -n "$DEVSPACES_NS" \
+        -o jsonpath='{.status.cheURL}' 2>/dev/null || true)
+    success "CheCluster is Active: $DS_URL"
+else
+    info "CheCluster phase: ${DS_PHASE:-pending}. Waiting up to ${DEVSPACES_WAIT}s..."
+    DS_ELAPSED=0
+    while [ $DS_ELAPSED -lt $DEVSPACES_WAIT ]; do
+        DS_PHASE=$(oc get checluster devspaces -n "$DEVSPACES_NS" \
+            -o jsonpath='{.status.chePhase}' 2>/dev/null || true)
+        if [ "$DS_PHASE" = "Active" ]; then
+            DS_URL=$(oc get checluster devspaces -n "$DEVSPACES_NS" \
+                -o jsonpath='{.status.cheURL}' 2>/dev/null || true)
+            success "CheCluster is Active: $DS_URL"
+            break
+        fi
+        sleep 10
+        DS_ELAPSED=$((DS_ELAPSED + 10))
+    done
+    if [ "$DS_PHASE" != "Active" ]; then
+        warn "CheCluster not Active yet -- server pods may still be starting."
+    fi
+fi
+echo ""
+
 echo ""
 echo "=============================================="
 success "Done! Refresh the dashboard."
@@ -1757,6 +1897,8 @@ echo ""
 echo "  • MaaS setup: bash scripts/sno-setup-maas-35.sh"
 echo ""
 echo "  • Scale up GPU node: oc scale machineset <gpu-ms-name> -n openshift-machine-api --replicas=1"
+echo ""
+echo "  • DevSpaces dashboard: oc get checluster devspaces -n openshift-devspaces -o jsonpath='{.status.cheURL}'"
 echo ""
 echo "  • If some operators show ⬚, re-run this script."
 echo "    Operators installed by OLM continue in the background."
