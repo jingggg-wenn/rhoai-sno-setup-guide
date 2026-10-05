@@ -751,7 +751,7 @@ oc patch odhdashboardconfig odh-dashboard-config \
       "disableModelCatalog": false,
       "disableKServeMetrics": false,
       "disableLMEval": false,
-      "disableKueue": false,
+      "disableKueue": true,
       "disableTracking": false,
       "disablePerformanceMetrics": false,
       "disableDistributedWorkloads": false,
