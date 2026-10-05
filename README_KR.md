@@ -120,6 +120,8 @@ bash scripts/sno-enable-all-features-35.sh
 > tail -f /tmp/sno.log
 > ```
 
+> **실행 결과 예시:** [sno-all-features-output.txt](sample-output/sno-all-features-output.txt)
+
 ### 5단계: MaaS 설정
 
 스크립트 1이 완료된 후 (모든 오퍼레이터 설치 및 검증 완료):
@@ -140,6 +142,8 @@ bash scripts/sno-setup-maas-35.sh
 --postgres-connection <url>   내장 POC 인스턴스 대신 외부 PostgreSQL 사용
 --skip-rate-limiting          Redis 및 EnvoyFilter 설정 건너뛰기
 ```
+
+> **실행 결과 예시:** [enable-maas-output.txt](sample-output/enable-maas-output.txt)
 
 ### 6단계: 모델 배포
 

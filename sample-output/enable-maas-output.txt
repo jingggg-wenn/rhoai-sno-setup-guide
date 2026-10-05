@@ -1,0 +1,112 @@
+Welcome to the OpenShift Web Terminal. Type "help" for a list of installed CLI tools.
+bash-5.1 ~ $ curl -sL https://raw.githubusercontent.com/jingggg-wenn/rhoai-sno-setup-guide/main/scripts/sno-setup-maas-35.sh | bash
+bash: line 47: BASH_SOURCE[0]: unbound variable
+==============================================
+ RHOAI 3.5 SNO — MaaS Setup
+==============================================
+
+[INFO] === Pre-flight checks ===
+[OK]   Logged in: admin @ https://172.30.0.1:443
+[OK]   RHOAI: 3.5.1
+[OK]   RHCL operator ✓
+[OK]   AIGateway: Managed ✓
+[OK]   maas-default-gateway ✓
+[OK]   Namespace: redhat-ai-gateway-infra ✓
+[INFO] Patching openshift-ai-inference gateway for DS project access...
+namespace/openshift-ingress labeled
+namespace/redhat-ods-applications labeled
+gateway.gateway.networking.k8s.io/openshift-ai-inference patched
+[OK]   Inference gateway: all DS projects allowed
+[INFO] Fixing inference gateway TLS cert reference...
+gateway.gateway.networking.k8s.io/openshift-ai-inference patched
+[OK]   Inference gateway TLS fixed (cert-manager-ingress-cert)
+
+[INFO] Adding admin to rhods-admins group...
+group.user.openshift.io/rhods-admins added: "admin"
+[OK]   admin added to rhods-admins
+
+[INFO] === Step 1/5: PostgreSQL database ===
+[WARN] No --postgres-connection provided. Deploying POC PostgreSQL (NOT for production).
+[INFO] For production: AWS RDS, Crunchy Operator, or Azure Database for PostgreSQL
+
+[INFO] PostgreSQL image: registry.redhat.io/rhel9/postgresql-16@sha256:510ac645787b2ba27f6ab8bb8488656d025d8c2ddcbf8cc5b15447dac941687b
+[INFO] Deploying PostgreSQL inline...
+persistentvolumeclaim/postgres-data created
+service/postgres created
+deployment.apps/postgres created
+[INFO] Waiting for PostgreSQL...
+[OK]   PostgreSQL ready
+secret/maas-db-config created
+secret/maas-db-config created
+secret/postgres-creds created
+[OK]   maas-db-config created in redhat-ai-gateway-infra (FQDN: postgres.redhat-ods-applications.svc.cluster.local)
+
+[INFO] === Step 2/5: Kuadrant + Authorino TLS (kuadrant-system) ===
+[INFO] Waiting for RHCL sub-operators to be ready...
+[OK]   All RHCL sub-operators ready (Authorino, Limitador)
+[INFO] Waiting for Kuadrant to become Ready (up to 120s)...
+[OK]   Kuadrant Ready in kuadrant-system ✓
+[OK]   Authorino created in kuadrant-system ✓
+[OK]   Limitador created in kuadrant-system ✓
+[OK]   Authorino TLS already enabled ✓
+gateway.gateway.networking.k8s.io/maas-default-gateway annotated
+[OK]   Kuadrant + Authorino TLS configuration complete
+
+[INFO] === Step 3/5: Rate limiting (Redis + EnvoyFilters) ===
+[INFO] Deploying Redis...
+deployment.apps/limitador-redis created
+service/limitador-redis created
+Waiting for deployment "limitador-redis" rollout to finish: 0 of 1 updated replicas are available...
+deployment "limitador-redis" successfully rolled out
+[OK]   Redis deployed
+secret/limitador-redis-config created
+[INFO] Configuring Limitador with redis-cached storage...
+limitador.limitador.kuadrant.io/limitador patched
+[OK]   Limitador configured with Redis
+[INFO] Applying health check EnvoyFilter...
+envoyfilter.networking.istio.io/healthcheck-filter created
+[OK]   Health check filter applied
+[INFO] Applying ratelimit timeout EnvoyFilter...
+envoyfilter.networking.istio.io/increase-ratelimit-cluster-timeout created
+[OK]   Ratelimit timeout (2s) applied
+deployment.apps/maas-default-gateway-maas-gateway-class restarted
+[OK]   Rate limiting configured
+
+[INFO] Restarting maas-api to pick up configuration...
+deployment.apps/maas-api restarted
+[OK]   maas-api running ✓
+
+[INFO] === Step 4/5: Kuadrant AuthPolicy reconciliation ===
+[INFO] Waiting for gateway AuthPolicy to be enforced (up to 90s)...
+[OK]   Gateway AuthPolicy enforced ✓
+
+[INFO] === Step 5/5: Verification ===
+  ✅ maas-db-config in redhat-ai-gateway-infra
+  ✅ Authorino TLS enabled & ready (kuadrant-system)
+  ✅ Kuadrant operator running
+  ✅ Gateway AuthPolicy enforced
+  ✅ maas-api running
+  ✅ admin in rhods-admins group
+  ⬚  MaaS Tenant (not found yet — may take a few minutes)
+  ✅ ModelsAsAServiceReady
+
+==============================================
+[OK]   MaaS setup complete!
+
+  MaaS endpoint:  https://maas.apps.ocp.krp78.sandbox3072.opentlc.com
+  Dashboard:      https://data-science-gateway.apps.ocp.krp78.sandbox3072.opentlc.com
+
+  Next steps:
+  ────────────────────────────────────────────
+  1. Deploy model:  Dashboard → Gen AI Studio → Deploy (llm-d runtime)
+  2. Register subscription + auth policy via Dashboard
+  3. Verify:
+     TOKEN=$(oc whoami -t)
+     curl -sk https://maas.apps.ocp.krp78.sandbox3072.opentlc.com/v1/models -H "Authorization: Bearer $TOKEN"
+
+  ⚠ Known issue (RHOAI 3.5.1):
+    Non-streaming chat/completions via MaaS gateway may return empty body.
+    Caused by ext_proc (FULL_DUPLEX_STREAMED) response body processing.
+    Streaming (stream:true) works correctly — Playground uses streaming.
+==============================================
+bash-5.1 ~ $ 

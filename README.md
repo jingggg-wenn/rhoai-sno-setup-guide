@@ -18,6 +18,8 @@ This is an **unofficial** setup script, not maintained or endorsed by Red Hat. I
 
 ---
 
+
+
 ## Purpose
 
 This is a lightweight repo containing two automation scripts extracted from the [RHOAI-Toolkit](https://github.com/hyogrin/RHOAI-Toolkit). The goal is self-enablement for Red Hat teams (SSA, ASA) and partners who want to quickly set up a fully-featured RHOAI 3.5 environment for demos, testing, or learning.
@@ -26,47 +28,63 @@ Instead of manually configuring dozens of operators, dashboard flags, CRDs, and 
 
 ---
 
+
+
 ## Environment Details: GPU and MachineSet
 
 The RHDP demo environment comes with a GPU node already provisioned. This is sufficient for deploying a single model. If you need to deploy additional models concurrently, you may need to create additional GPU MachineSets to provide more GPU capacity.
 
 ---
 
+
+
 ## What Gets Configured
+
+
 
 ### Script 1: `sno-enable-all-features-35.sh`
 
 Enables all RHOAI 3.5 DSC components and dashboard features in 9 steps:
 
-| Step | What it does |
-|------|-------------|
-| 1 | User Workload Monitoring |
-| 2 | DSC component activation (MLflow, OGX, AIGateway, MaaS) |
-| 3 | MLflow server + EvalHub + demo Data Science Project |
-| 4 | MaaS Gateway (GatewayClass + Gateway CRs) |
-| 5 | Dashboard menu activation (all feature flags) |
-| 6 | Operator install (Kueue, cert-manager, LWS, OpenTelemetry, Tempo, COO, RHCL) |
-| 7 | DSCI observability (metrics, traces, MonitoringStack, Perses) + Kuadrant CR + UIPlugins |
-| 8 | Dashboard restart |
-| 9 | Verification |
+
+| Step | What it does                                                                            |
+| ---- | --------------------------------------------------------------------------------------- |
+| 1    | User Workload Monitoring                                                                |
+| 2    | DSC component activation (MLflow, OGX, AIGateway, MaaS)                                 |
+| 3    | MLflow server + EvalHub + demo Data Science Project                                     |
+| 4    | MaaS Gateway (GatewayClass + Gateway CRs)                                               |
+| 5    | Dashboard menu activation (all feature flags)                                           |
+| 6    | Operator install (Kueue, cert-manager, LWS, OpenTelemetry, Tempo, COO, RHCL)            |
+| 7    | DSCI observability (metrics, traces, MonitoringStack, Perses) + Kuadrant CR + UIPlugins |
+| 8    | Dashboard restart                                                                       |
+| 9    | Verification                                                                            |
+
+
+
 
 ### Script 2: `sno-setup-maas-35.sh`
 
 Configures MaaS infrastructure in 5 steps:
 
-| Step | What it does |
-|------|-------------|
-| 1 | PostgreSQL database (POC deployment or external connection) |
-| 2 | Kuadrant CR + Authorino TLS in `kuadrant-system` |
-| 3 | Rate limiting (Redis + EnvoyFilters) |
-| 4 | Kuadrant AuthPolicy reconciliation |
-| 5 | Verification |
+
+| Step | What it does                                                |
+| ---- | ----------------------------------------------------------- |
+| 1    | PostgreSQL database (POC deployment or external connection) |
+| 2    | Kuadrant CR + Authorino TLS in `kuadrant-system`            |
+| 3    | Rate limiting (Redis + EnvoyFilters)                        |
+| 4    | Kuadrant AuthPolicy reconciliation                          |
+| 5    | Verification                                                |
+
 
 Both scripts are **idempotent** -- safe to re-run if interrupted or if operators are still installing in the background.
 
 ---
 
+
+
 ## Steps
+
+
 
 ### Step 1: Order the environment
 
@@ -87,11 +105,11 @@ From the OpenShift console:
 
 ![Web Terminal Operator in Software Catalog](images/img-web-terminal-operator.png)
 
-3. Install it with default settings
+1. Install it with default settings
 
 ![Install Web Terminal](images/img-install-web-terminal.png)
 
-4. Once installed, click the **>_** icon in the top-right of the console to open a terminal session
+1. Once installed, click the **>_** icon in the top-right of the console to open a terminal session
 
 ![Open Web Terminal](images/img-initiate-cli.png)
 
@@ -114,13 +132,8 @@ bash scripts/sno-enable-all-features-35.sh
 ```
 
 > **Tip:** In Web Terminal, RHCL/Service Mesh installation (Step 6) may briefly disconnect your session. If this happens, operators continue installing via OLM in the background. Reconnect and re-run the script -- completed steps are skipped.
->
-> For uninterrupted execution:
->
-> ```bash
-> nohup bash scripts/sno-enable-all-features-35.sh > /tmp/sno.log 2>&1 &
-> tail -f /tmp/sno.log
-> ```
+
+> **Sample output:** [sno-all-features-output.txt](sample-output/sno-all-features-output.txt)
 
 ### Step 5: Set up MaaS
 
@@ -143,6 +156,8 @@ Options:
 --skip-rate-limiting          Skip Redis and EnvoyFilter setup
 ```
 
+> **Sample output:** [enable-maas-output.txt](sample-output/enable-maas-output.txt)
+
 ### Step 6: Deploy a model
 
 Once both scripts complete:
@@ -151,6 +166,8 @@ Once both scripts complete:
 2. Go to **Gen AI Studio** > **Deploy**
 3. Select a model and deploy with the **llm-d** runtime for MaaS integration
 4. Register a subscription and auth policy via the Dashboard
+
+
 
 ### Step 7: Verify MaaS endpoint
 
@@ -162,11 +179,15 @@ curl -sk https://maas.${CLUSTER_DOMAIN}/v1/models -H "Authorization: Bearer $TOK
 
 ---
 
+
+
 ## Known Issues (RHOAI 3.5.1)
 
 - **Non-streaming chat/completions via MaaS gateway** may return empty (0-byte) responses. This is caused by the `ext_proc` filter's `FULL_DUPLEX_STREAMED` response body mode conflicting with single-body (non-streaming) responses. Streaming (`stream: true`) works correctly. The Playground uses streaming by default and is not affected.
 
 ---
+
+
 
 ## Verification Commands
 
@@ -193,3 +214,4 @@ oc get tenant -n models-as-a-service
 oc get kuadrant -n kuadrant-system
 oc get authorino -n kuadrant-system
 ```
+
