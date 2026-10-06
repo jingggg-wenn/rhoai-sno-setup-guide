@@ -1,6 +1,7 @@
 # RHOAI 3.5 SNO 설정 가이드
 
 작성일: 29 Sep 2026
+최종 수정: 06 Oct 2026
 
 Single Node OpenShift (SNO) 클러스터에서 Red Hat OpenShift AI 3.5의 모든 기능을 스크립트 하나로 활성화합니다. Models-as-a-Service (MaaS), 관측성(Observability), 평가 도구(Evaluation tooling)를 포함합니다.
 
@@ -18,9 +19,9 @@ Single Node OpenShift (SNO) 클러스터에서 Red Hat OpenShift AI 3.5의 모�
 
 ## 목적
 
-이 리포지토리는 [RHOAI-Toolkit](https://github.com/hyogrin/RHOAI-Toolkit)에서 추출한 2개의 자동화 스크립트를 포함하는 경량 리포지토리입니다. Red Hat 팀(SSA, ASA) 및 파트너가 데모, 테스트, 학습을 위해 RHOAI 3.5 환경의 모든 기능을 빠르게 설정할 수 있도록 셀프 활성화(Self-enablement)를 목표로 합니다.
+이 리포지토리는 [RHOAI-Toolkit](https://github.com/hyogrin/RHOAI-Toolkit)에서 추출한 자동화 스크립트를 포함하는 경량 리포지토리입니다. Red Hat 팀(SSA, ASA) 및 파트너가 데모, 테스트, 학습을 위해 RHOAI 3.5 환경의 모든 기능을 빠르게 설정할 수 있도록 셀프 활성화(Self-enablement)를 목표로 합니다.
 
-수십 개의 오퍼레이터, 대시보드 플래그, CRD, 게이트웨이 리소스를 하나하나 수동으로 설정하는 대신, 이 스크립트 2개를 순차적으로 실행하면 전체 설정이 완료됩니다.
+수십 개의 오퍼레이터, 대시보드 플래그, CRD, 게이트웨이 리소스를 하나하나 수동으로 설정하는 대신, 이 스크립트를 순차적으로 실행하면 전체 설정이 완료됩니다.
 
 ---
 
@@ -34,7 +35,7 @@ RHDP 데모 환경에는 GPU 노드가 이미 프로비저닝되어 있습니다
 
 ### 스크립트 1: `sno-enable-all-features-35.sh`
 
-RHOAI 3.5 DSC 컴포넌트 및 대시보드 기능을 9단계로 활성화합니다:
+RHOAI 3.5 DSC 컴포넌트 및 대시보드 기능을 활성화합니다:
 
 | 단계 | 내용 |
 |------|------|
@@ -43,6 +44,8 @@ RHOAI 3.5 DSC 컴포넌트 및 대시보드 기능을 9단계로 활성화합니
 | 3 | MLflow 서버 + EvalHub + demo Data Science Project |
 | 4 | MaaS Gateway (GatewayClass + Gateway CR) |
 | 5 | 대시보드 메뉴 활성화 (모든 기능 플래그) |
+| 5b | Accelerator 메트릭 기록 규칙 (GPU Operator 전제 조건) |
+| 5c | Red Hat OpenShift Dev Spaces (오퍼레이터 + CheCluster) |
 | 6 | 오퍼레이터 설치 (Kueue, cert-manager, LWS, OpenTelemetry, Tempo, COO, RHCL) |
 | 7 | DSCI 관측성 (메트릭, 트레이스, MonitoringStack, Perses) + Kuadrant CR + UIPlugins |
 | 8 | 대시보드 재시작 |
@@ -50,7 +53,7 @@ RHOAI 3.5 DSC 컴포넌트 및 대시보드 기능을 9단계로 활성화합니
 
 ### 스크립트 2: `sno-setup-maas-35.sh`
 
-MaaS 인프라를 5단계로 구성합니다:
+MaaS 인프라를 구성합니다:
 
 | 단계 | 내용 |
 |------|------|
@@ -60,7 +63,18 @@ MaaS 인프라를 5단계로 구성합니다:
 | 4 | Kuadrant AuthPolicy 재조정(Reconciliation) |
 | 5 | 검증 |
 
-두 스크립트 모두 **멱등(idempotent)** 합니다 -- 중단되거나 오퍼레이터가 백그라운드에서 설치 중이더라도 안전하게 재실행할 수 있습니다.
+### 워크숍 준비: `scripts/workshop-prep/`
+
+다중 사용자 워크숍을 위한 클러스터 준비 스크립트(선택 사항). **로컬 터미널**에서 실행합니다(Web Terminal 불가).
+
+| 스크립트 | 내용 |
+|---|---|
+| `create_workshop_users.sh` | htpasswd 사용자(`user01`..`userN`) 생성, cluster-admin RBAC 및 `rhods-admins` 그룹 멤버십 부여. `--num-users=<N>` 옵션 지원 (기본값: 20). |
+| `gpu_machineset_hardwareprofiles.sh` | GPU MachineSet(`g6.2xlarge`, replicas=0) 생성 및 `gpu-profile` HardwareProfile에 nodeSelector + toleration 패치. Kueue 불필요. |
+
+자세한 내용은 [`scripts/workshop-prep/README.md`](scripts/workshop-prep/README.md)를 참조하세요.
+
+모든 스크립트는 **멱등(idempotent)** 합니다 -- 중단되거나 오퍼레이터가 백그라운드에서 설치 중이더라도 안전하게 재실행할 수 있습니다.
 
 ---
 

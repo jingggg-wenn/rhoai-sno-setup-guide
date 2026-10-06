@@ -1,6 +1,7 @@
 # RHOAI 3.5 SNO Setup Guide
 
 Created: 29 Sep 2026
+Last modified: 06 Oct 2026
 
 **한국어 가이드는 [여기](README_KR.md)를 참고하세요.**
 
@@ -22,9 +23,9 @@ This is an **unofficial** setup script, not maintained or endorsed by Red Hat. I
 
 ## Purpose
 
-This is a lightweight repo containing two automation scripts extracted from the [RHOAI-Toolkit](https://github.com/hyogrin/RHOAI-Toolkit). The goal is self-enablement for Red Hat teams (SSA, ASA) and partners who want to quickly set up a fully-featured RHOAI 3.5 environment for demos, testing, or learning.
+This is a lightweight repo containing automation scripts extracted from the [RHOAI-Toolkit](https://github.com/hyogrin/RHOAI-Toolkit). The goal is self-enablement for Red Hat teams (SSA, ASA) and partners who want to quickly set up a fully-featured RHOAI 3.5 environment for demos, testing, or learning.
 
-Instead of manually configuring dozens of operators, dashboard flags, CRDs, and gateway resources one by one, these scripts handle the entire setup in two sequential runs.
+Instead of manually configuring dozens of operators, dashboard flags, CRDs, and gateway resources one by one, these scripts handle the entire setup in sequential runs.
 
 ---
 
@@ -44,39 +45,46 @@ The RHDP demo environment comes with a GPU node already provisioned. This is suf
 
 ### Script 1: `sno-enable-all-features-35.sh`
 
-Enables all RHOAI 3.5 DSC components and dashboard features in 9 steps:
+Enables all RHOAI 3.5 DSC components and dashboard features:
 
-
-| Step | What it does                                                                            |
-| ---- | --------------------------------------------------------------------------------------- |
-| 1    | User Workload Monitoring                                                                |
-| 2    | DSC component activation (MLflow, OGX, AIGateway, MaaS)                                 |
-| 3    | MLflow server + EvalHub + demo Data Science Project                                     |
-| 4    | MaaS Gateway (GatewayClass + Gateway CRs)                                               |
-| 5    | Dashboard menu activation (all feature flags)                                           |
-| 6    | Operator install (Kueue, cert-manager, LWS, OpenTelemetry, Tempo, COO, RHCL)            |
-| 7    | DSCI observability (metrics, traces, MonitoringStack, Perses) + Kuadrant CR + UIPlugins |
-| 8    | Dashboard restart                                                                       |
-| 9    | Verification                                                                            |
-
-
-
+| Step | What it does |
+|------|---|
+| 1 | User Workload Monitoring |
+| 2 | DSC component activation (MLflow, OGX, AIGateway, MaaS) |
+| 3 | MLflow server + EvalHub + demo Data Science Project |
+| 4 | MaaS Gateway (GatewayClass + Gateway CRs) |
+| 5 | Dashboard menu activation (all feature flags) |
+| 5b | Accelerator metrics recording rules (GPU Operator prerequisite) |
+| 5c | Red Hat OpenShift Dev Spaces (operator + CheCluster) |
+| 6 | Operator install (Kueue, cert-manager, LWS, OpenTelemetry, Tempo, COO, RHCL) |
+| 7 | DSCI observability (metrics, traces, MonitoringStack, Perses) + Kuadrant CR + UIPlugins |
+| 8 | Dashboard restart |
+| 9 | Verification |
 
 ### Script 2: `sno-setup-maas-35.sh`
 
-Configures MaaS infrastructure in 5 steps:
+Configures MaaS infrastructure:
 
+| Step | What it does |
+|------|---|
+| 1 | PostgreSQL database (POC deployment or external connection) |
+| 2 | Kuadrant CR + Authorino TLS in `kuadrant-system` |
+| 3 | Rate limiting (Redis + EnvoyFilters) |
+| 4 | Kuadrant AuthPolicy reconciliation |
+| 5 | Verification |
 
-| Step | What it does                                                |
-| ---- | ----------------------------------------------------------- |
-| 1    | PostgreSQL database (POC deployment or external connection) |
-| 2    | Kuadrant CR + Authorino TLS in `kuadrant-system`            |
-| 3    | Rate limiting (Redis + EnvoyFilters)                        |
-| 4    | Kuadrant AuthPolicy reconciliation                          |
-| 5    | Verification                                                |
+### Workshop Prep: `scripts/workshop-prep/`
 
+Optional scripts for preparing the cluster for a multi-user workshop. Run from a **local terminal** (not Web Terminal).
 
-Both scripts are **idempotent** -- safe to re-run if interrupted or if operators are still installing in the background.
+| Script | What it does |
+|---|---|
+| `create_workshop_users.sh` | Creates htpasswd users (`user01`..`userN`) with cluster-admin RBAC and `rhods-admins` group membership. Supports `--num-users=<N>` (default: 20). |
+| `gpu_machineset_hardwareprofiles.sh` | Creates a GPU MachineSet (`g6.2xlarge`, replicas=0) and patches the `gpu-profile` HardwareProfile with nodeSelector + toleration. No Kueue dependency. |
+
+See [`scripts/workshop-prep/README.md`](scripts/workshop-prep/README.md) for details.
+
+All scripts are **idempotent** -- safe to re-run if interrupted or if operators are still installing in the background.
 
 ---
 
