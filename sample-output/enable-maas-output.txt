@@ -1,4 +1,3 @@
-Welcome to the OpenShift Web Terminal. Type "help" for a list of installed CLI tools.
 bash-5.1 ~ $ curl -sL https://raw.githubusercontent.com/jingggg-wenn/rhoai-sno-setup-guide/main/scripts/sno-setup-maas-35.sh | bash
 bash: line 47: BASH_SOURCE[0]: unbound variable
 ==============================================
@@ -6,7 +5,7 @@ bash: line 47: BASH_SOURCE[0]: unbound variable
 ==============================================
 
 [INFO] === Pre-flight checks ===
-[OK]   Logged in: admin @ https://172.30.0.1:443
+[OK]   Logged in: user01 @ https://172.30.0.1:443
 [OK]   RHOAI: 3.5.1
 [OK]   RHCL operator ✓
 [OK]   AIGateway: Managed ✓
@@ -21,9 +20,7 @@ gateway.gateway.networking.k8s.io/openshift-ai-inference patched
 gateway.gateway.networking.k8s.io/openshift-ai-inference patched
 [OK]   Inference gateway TLS fixed (cert-manager-ingress-cert)
 
-[INFO] Adding admin to rhods-admins group...
-group.user.openshift.io/rhods-admins added: "admin"
-[OK]   admin added to rhods-admins
+[OK]   user01 already in rhods-admins ✓
 
 [INFO] === Step 1/5: PostgreSQL database ===
 [WARN] No --postgres-connection provided. Deploying POC PostgreSQL (NOT for production).
@@ -86,15 +83,15 @@ deployment.apps/maas-api restarted
   ✅ Kuadrant operator running
   ✅ Gateway AuthPolicy enforced
   ✅ maas-api running
-  ✅ admin in rhods-admins group
+  ✅ user01 in rhods-admins group
   ⬚  MaaS Tenant (not found yet — may take a few minutes)
   ✅ ModelsAsAServiceReady
 
 ==============================================
 [OK]   MaaS setup complete!
 
-  MaaS endpoint:  https://maas.apps.ocp.krp78.sandbox3072.opentlc.com
-  Dashboard:      https://data-science-gateway.apps.ocp.krp78.sandbox3072.opentlc.com
+  MaaS endpoint:  https://maas.apps.ocp.5sh6j.sandbox1809.opentlc.com
+  Dashboard:      https://data-science-gateway.apps.ocp.5sh6j.sandbox1809.opentlc.com
 
   Next steps:
   ────────────────────────────────────────────
@@ -102,7 +99,7 @@ deployment.apps/maas-api restarted
   2. Register subscription + auth policy via Dashboard
   3. Verify:
      TOKEN=$(oc whoami -t)
-     curl -sk https://maas.apps.ocp.krp78.sandbox3072.opentlc.com/v1/models -H "Authorization: Bearer $TOKEN"
+     curl -sk https://maas.apps.ocp.5sh6j.sandbox1809.opentlc.com/v1/models -H "Authorization: Bearer $TOKEN"
 
   ⚠ Known issue (RHOAI 3.5.1):
     Non-streaming chat/completions via MaaS gateway may return empty body.

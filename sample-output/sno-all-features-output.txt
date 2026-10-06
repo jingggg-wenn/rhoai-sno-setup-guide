@@ -1,140 +1,135 @@
+Welcome to the OpenShift Web Terminal. Type "help" for a list of installed CLI tools.
+bash-5.1 ~ $ curl -sL https://raw.githubusercontent.com/jingggg-wenn/rhoai-sno-setup-guide/main/scripts/sno-enable-all-features-35.sh | bash
 ==============================================
  RHOAI 3.5 SNO — Enable All Features
 ==============================================
 
-[0;36m[INFO][0m Order: Config (1-5b) → Operators (6) → Post-op (7) → Restart (8) → Verify (9)
-[0;36m[INFO][0m Steps 1-5b complete before any network disruption.
+[INFO] Order: Config (1-5c) → Operators (6) → Post-op (7) → Restart (8) → Verify (9)
+[INFO] Steps 1-5b complete before any network disruption.
 
-[0;36m[INFO][0m === Prerequisites ===
-[0;32m[OK][0m   Logged in: admin @ https://api.ocp.krp78.sandbox3072.opentlc.com:6443
-[0;32m[OK][0m   RHOAI: 3.5.1
-[0;32m[OK][0m   DSC: default-dsc
+[INFO] === Prerequisites ===
+[OK]   Logged in: user01 @ https://172.30.0.1:443
+[OK]   RHOAI: 3.5.1
+[OK]   DSC: default-dsc
 
-[0;36m[INFO][0m === Step 1/9: User Workload Monitoring ===
-[0;32m[OK][0m   User Workload Monitoring already enabled ✓
+[INFO] === Step 1/9: User Workload Monitoring ===
+[OK]   User Workload Monitoring already enabled ✓
 
-[0;36m[INFO][0m === Step 2/9: DSC component activation ===
+[INFO] === Step 2/9: DSC component activation ===
 datasciencecluster.datasciencecluster.opendatahub.io/default-dsc patched (no change)
-[0;32m[OK][0m   DSC patched
-[0;36m[INFO][0m Waiting for OGX provisioning...
-[0;32m[OK][0m   OGX CRD registered ✓
+[OK]   DSC patched
+[INFO] Waiting for OGX provisioning...
+[OK]   OGX CRD registered ✓
 
-[0;36m[INFO][0m === Step 3/9: MLflow server + demo project ===
-[0;32m[OK][0m   Namespace 'demo' exists ✓
+[INFO] === Step 3/9: MLflow server + demo project ===
+[OK]   Namespace 'demo' exists ✓
 namespace/demo not labeled
-[0;32m[OK][0m   demo labeled as Data Science Project
-[0;36m[INFO][0m Waiting for MLflow CRD...
-[0;32m[OK][0m   MLflow CRD registered ✓
-[0;32m[OK][0m   MLflow server running ✓
+[OK]   demo labeled as Data Science Project
+[INFO] Waiting for MLflow CRD...
+[OK]   MLflow CRD registered ✓
+[OK]   MLflow server running ✓
 
-[0;32m[OK][0m   EvalHub CRD registered ✓
-[0;32m[OK][0m   EvalHub already exists in redhat-ods-applications ✓
-[0;32m[OK][0m   EvalHub MLFLOW_TRACKING_URI already set ✓
-[0;36m[INFO][0m Configuring EvalHub RBAC for demo namespace...
+[OK]   EvalHub CRD registered ✓
+[OK]   EvalHub already exists in redhat-ods-applications ✓
+[OK]   EvalHub MLFLOW_TRACKING_URI already set ✓
+[INFO] Configuring EvalHub RBAC for demo namespace...
 rolebinding.rbac.authorization.k8s.io/evalhub-central-mlflow-access unchanged
 rolebinding.rbac.authorization.k8s.io/evalhub-central-jobs-writer unchanged
 rolebinding.rbac.authorization.k8s.io/evalhub-central-job-config unchanged
 clusterrole.rbac.authorization.k8s.io/edit added: "system:serviceaccount:demo:evalhub-redhat-ods-applications-job"
-[0;32m[OK][0m   evalhub SA already has edit in demo ✓
-[0;32m[OK][0m   evalhub-service secret access already configured ✓
-[0;32m[OK][0m   evalhub-service-ca ConfigMap already in demo ✓
-[0;32m[OK][0m   EvalHub RBAC configured for demo namespace
+[OK]   evalhub SA already has edit in demo ✓
+[OK]   evalhub-service secret access already configured ✓
+[OK]   evalhub-service-ca ConfigMap already in demo ✓
+[OK]   EvalHub RBAC configured for demo namespace
 
-[0;36m[INFO][0m === Step 4/9: MaaS Gateway ===
-[0;36m[INFO][0m Domain: apps.ocp.krp78.sandbox3072.opentlc.com, TLS: cert-manager-ingress-cert
+[INFO] === Step 4/9: MaaS Gateway ===
+[INFO] Domain: apps.ocp.5sh6j.sandbox1809.opentlc.com, TLS: cert-manager-ingress-cert
 gatewayclass.gateway.networking.k8s.io/maas-gateway-class unchanged
-[0;32m[OK][0m   maas-default-gateway already exists ✓
+[OK]   maas-default-gateway already exists ✓
 
-[0;36m[INFO][0m === Step 5/9: Dashboard menu activation ===
+[INFO] === Step 5/9: Dashboard menu activation ===
 odhdashboardconfig.opendatahub.io/odh-dashboard-config patched (no change)
-[0;32m[OK][0m   Dashboard menu patched
+[OK]   Dashboard menu patched
 
-[0;36m[INFO][0m Configuring accelerator metrics recording rules...
+[INFO] Configuring accelerator metrics recording rules...
 prometheusrule.monitoring.coreos.com/accelerator-recording-rules unchanged
-[0;32m[OK][0m   Accelerator metrics recording rules created
+[OK]   Accelerator metrics recording rules created
+
+[INFO] === Step 5c: Red Hat OpenShift Dev Spaces ===
+[OK]   DevSpaces operator already installed: devspacesoperator.v3.30.2
+[OK]   Namespace openshift-devspaces already exists.
+[OK]   CheCluster already exists (phase: Active).
+[OK]   CheCluster is Active: https://devspaces.apps.ocp.5sh6j.sandbox1809.opentlc.com
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-[0;32m[OK][0m   Core configuration complete (Steps 1-5b).
-[0;36m[INFO][0m Next: operator install (Step 6) may briefly disrupt Web Terminal.
-[0;36m[INFO][0m If disconnected, re-run this script — completed steps are skipped.
+[OK]   Core configuration complete (Steps 1-5c).
+[INFO] Next: operator install (Step 6) may briefly disrupt Web Terminal.
+[INFO] If disconnected, re-run this script — completed steps are skipped.
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-[0;36m[INFO][0m === Step 6/9: Operator scan & install ===
-[1;33m[WARN][0m Kueue — not installed  (needed for: Workbenches / DW)
-[1;33m[WARN][0m cert-manager — not installed  (needed for: KServe / Model Serving)
-[0;32m[OK][0m   LWS (LeaderWorkerSet) ✓
-[1;33m[WARN][0m OpenTelemetry — not installed  (needed for: Metrics & trace collection)
-[0;32m[OK][0m   Tempo ✓
-[1;33m[WARN][0m COO (Cluster Observability) — not installed  (needed for: Observe & Monitor dashboard (Perses))
-[1;33m[WARN][0m RHCL (Red Hat Connectivity Link) — not installed  (needed for: MaaS / AIGateway)
+[INFO] === Step 6/9: Operator scan & install ===
+[OK]   Kueue ✓
+[OK]   cert-manager ✓
+[OK]   LWS (LeaderWorkerSet) ✓
+[OK]   OpenTelemetry ✓
+[OK]   Tempo ✓
+[WARN] COO (Cluster Observability) — not installed  (needed for: Observe & Monitor dashboard (Perses))
+[OK]   RHCL (Red Hat Connectivity Link) ✓
 
-[1m┌─────────────────────────────────────────────────────────┐[0m
-[1m│  5 operator(s) not installed                          │[0m
-[1m├─────────────────────────────────────────────────────────┤[0m
-[1m│[0m  1.  Kueue                          → Workbenches / DW
-[1m│[0m  2.  cert-manager                   → KServe / Model Serving
-[1m│[0m  3.  OpenTelemetry                  → Metrics & trace collection
-[1m│[0m  4.  COO (Cluster Observability)    → Observe & Monitor dashboard (Perses)
-[1m│[0m  5.  RHCL (Red Hat Connectivity Link) → MaaS / AIGateway
-[1m└─────────────────────────────────────────────────────────┘[0m
-[0;36m[INFO][0m Auto-installing missing operators...
-[0;36m[INFO][0m RHCL triggers Service Mesh — Web Terminal may briefly disconnect.
+┌─────────────────────────────────────────────────────────┐
+│  1 operator(s) not installed                          │
+├─────────────────────────────────────────────────────────┤
+│  1.  COO (Cluster Observability)    → Observe & Monitor dashboard (Perses)
+└─────────────────────────────────────────────────────────┘
+[INFO] Auto-installing missing operators...
+[INFO] RHCL triggers Service Mesh — Web Terminal may briefly disconnect.
 
-[0;36m[INFO][0m Installing Kueue (ns=openshift-operators, ch=stable-v1.3, mode=skip)...
-subscription.operators.coreos.com/kueue-operator unchanged
-[0;36m[INFO][0m Installing cert-manager (ns=cert-manager-operator, ch=stable-v1, mode=own)...
-namespace/cert-manager-operator unchanged
-operatorgroup.operators.coreos.com/openshift-cert-manager-operator-group unchanged
-subscription.operators.coreos.com/openshift-cert-manager-operator unchanged
-[0;36m[INFO][0m Installing OpenTelemetry (ns=openshift-opentelemetry-operator, ch=stable, mode=all)...
-namespace/openshift-opentelemetry-operator unchanged
-operatorgroup.operators.coreos.com/opentelemetry-product-group unchanged
-subscription.operators.coreos.com/opentelemetry-product unchanged
-[0;36m[INFO][0m Installing COO (Cluster Observability) (ns=openshift-cluster-observability-operator, ch=stable, mode=all)...
+[INFO] Installing COO (Cluster Observability) (ns=openshift-cluster-observability-operator, ch=stable, mode=all)...
 namespace/openshift-cluster-observability-operator unchanged
 operatorgroup.operators.coreos.com/cluster-observability-operator-group unchanged
 subscription.operators.coreos.com/cluster-observability-operator unchanged
-[0;36m[INFO][0m Auto-detected channel: stable for rhcl-operator
-[0;36m[INFO][0m Installing RHCL (Red Hat Connectivity Link) (ns=redhat-connectivity-link-operator, ch=stable, mode=all)...
-namespace/redhat-connectivity-link-operator unchanged
-operatorgroup.operators.coreos.com/rhcl-operator-group unchanged
-subscription.operators.coreos.com/rhcl-operator unchanged
 
-[0;36m[INFO][0m Waiting for operators (up to 4min)...
-[1;33m[WARN][0m Kueue — still installing (continues in background)
-[1;33m[WARN][0m cert-manager — still installing (continues in background)
-[1;33m[WARN][0m OpenTelemetry — still installing (continues in background)
-[1;33m[WARN][0m COO (Cluster Observability) — still installing (continues in background)
-[1;33m[WARN][0m RHCL (Red Hat Connectivity Link) — still installing (continues in background)
-[0;32m[OK][0m   LeaderWorkerSetOperator CR already exists ✓
-[1;33m[WARN][0m Kueue CRDs not ready yet — resource queues will be configured on next run
-[0;36m[INFO][0m Configuring UIPlugins...
+[INFO] Waiting for operators (up to 4min)...
+[OK]   COO (Cluster Observability) ✓
+[OK]   LeaderWorkerSetOperator CR already exists ✓
+[WARN] Kueue CRDs not ready yet — resource queues will be configured on next run
+[INFO] Configuring UIPlugins...
 uiplugin.observability.openshift.io/dashboards unchanged
 uiplugin.observability.openshift.io/monitoring unchanged
-[0;32m[OK][0m   UIPlugins (dashboards + monitoring) configured
-[0;32m[OK][0m   Kuadrant CR already exists in kuadrant-system ✓
-[0;36m[INFO][0m Waiting for Kuadrant to become Ready...
-[0;32m[OK][0m   Kuadrant CR Ready in kuadrant-system ✓
-[0;32m[OK][0m   Authorino TLS already enabled in kuadrant-system ✓
-[1;33m[WARN][0m kuadrant-console-plugin pod not running yet — plugin will be enabled on next run
+[OK]   UIPlugins (dashboards + monitoring) configured
+[OK]   Kuadrant CR already exists in kuadrant-system ✓
+[INFO] Waiting for Kuadrant to become Ready...
+[OK]   Kuadrant CR Ready in kuadrant-system ✓
+[OK]   Authorino TLS already enabled in kuadrant-system ✓
+[OK]   RHCL console plugin already enabled ✓
 
-[0;36m[INFO][0m === Step 7/9: DSCI Observability + Post-operator setup ===
-[1;33m[WARN][0m COO not installed — Observe & Monitor will not work
-[0;32m[OK][0m   Tempo installed ✓
+[INFO] === Step 7/9: DSCI Observability + Post-operator setup ===
+[OK]   COO installed ✓
+[OK]   Tempo installed ✓
+[INFO] Configuring DSCI observability (metrics + traces)...
+[OK]   DSCI metrics already configured (storage: 5Gi) ✓
+[INFO] Waiting for MonitoringStack (up to 3 min)...
+[OK]   MonitoringStack ✓
+[INFO] Configuring DCGM metrics for RHOAI MonitoringStack...
+servicemonitor.monitoring.coreos.com/nvidia-dcgm-exporter unchanged
+prometheusrule.monitoring.coreos.com/accelerator-recording-rules unchanged
+[OK]   DCGM ServiceMonitor + recording rules created in redhat-ods-monitoring
+[INFO] Waiting for Perses...
+[OK]   Perses ✓
 
-[0;36m[INFO][0m === Step 8/9: Dashboard restart ===
+[INFO] === Step 8/9: Dashboard restart ===
 deployment.apps/rhods-dashboard restarted
-[0;36m[INFO][0m Restarting (1-2 min)...
+[INFO] Restarting (1-2 min)...
 Waiting for deployment "rhods-dashboard" rollout to finish: 1 out of 2 new replicas have been updated...
 Waiting for deployment "rhods-dashboard" rollout to finish: 1 out of 2 new replicas have been updated...
 Waiting for deployment "rhods-dashboard" rollout to finish: 1 out of 2 new replicas have been updated...
 Waiting for deployment "rhods-dashboard" rollout to finish: 1 old replicas are pending termination...
 Waiting for deployment "rhods-dashboard" rollout to finish: 1 old replicas are pending termination...
 deployment "rhods-dashboard" successfully rolled out
-[0;32m[OK][0m   Dashboard restarted
+[OK]   Dashboard restarted
 
-[0;36m[INFO][0m === Step 9/9: Verification ===
-[0;36m[INFO][0m DSC components:
+[INFO] === Step 9/9: Verification ===
+[INFO] DSC components:
   ✅ MLflowOperatorReady
   ✅ OGXReady
   ✅ AIGatewayReady
@@ -145,18 +140,19 @@ deployment "rhods-dashboard" successfully rolled out
   ✅ WorkbenchesReady
   ⬚  ModelsAsAServiceReady (NotReady)
 
-[0;36m[INFO][0m Operators:
-  ⬚  Kueue
-  ⬚  cert-manager
-  ⬚  LWS (LeaderWorkerSet)
-  ⬚  OpenTelemetry
+[INFO] Operators:
+  ✅ Kueue
+  ✅ cert-manager
+  ✅ LWS (LeaderWorkerSet)
+  ✅ OpenTelemetry
   ✅ Tempo
-  ⬚  COO (Cluster Observability)
-  ⬚  RHCL (Red Hat Connectivity Link)
+  ✅ COO (Cluster Observability)
+  ✅ RHCL (Red Hat Connectivity Link)
 
-[0;36m[INFO][0m Observability:
+[INFO] Observability:
   ✅ MonitoringStack
   ✅ Perses
 
-[0;36m[INFO][0m Kueue:
+[INFO] Kueue:
   ⬚  ClusterQueue default
+bash-5.1 ~ $ 
