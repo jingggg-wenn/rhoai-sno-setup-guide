@@ -19,8 +19,6 @@ This is an **unofficial** setup script, not maintained or endorsed by Red Hat. I
 
 ---
 
-
-
 ## Purpose
 
 This is a lightweight repo containing automation scripts extracted from the [RHOAI-Toolkit](https://github.com/hyogrin/RHOAI-Toolkit). The goal is self-enablement for Red Hat teams (SSA, ASA) and partners who want to quickly set up a fully-featured RHOAI 3.5 environment for demos, testing, or learning.
@@ -29,19 +27,13 @@ Instead of manually configuring dozens of operators, dashboard flags, CRDs, and 
 
 ---
 
-
-
 ## Environment Details: GPU and MachineSet
 
 The RHDP demo environment comes with a GPU node already provisioned. This is sufficient for deploying a single model. If you need to deploy additional models concurrently, you may need to create additional GPU MachineSets to provide more GPU capacity.
 
 ---
 
-
-
 ## What Gets Configured
-
-
 
 ### Script 1: `sno-enable-all-features-35.sh`
 
@@ -92,8 +84,6 @@ All scripts are **idempotent** -- safe to re-run if interrupted or if operators 
 
 ## Steps
 
-
-
 ### Step 1: Order the environment
 
 Go to [Red Hat Demo Platform (RHDP)](https://demo.redhat.com) and order **Red Hat OpenShift AI 3**. Allow time for the environment to fully provision and all nodes to become ready.
@@ -131,14 +121,6 @@ From the Web Terminal (or any terminal with `oc login` completed):
 curl -sL https://raw.githubusercontent.com/jingggg-wenn/rhoai-sno-setup-guide/main/scripts/sno-enable-all-features-35.sh | bash
 ```
 
-Or clone and run locally:
-
-```bash
-git clone https://github.com/jingggg-wenn/rhoai-sno-setup-guide.git
-cd rhoai-sno-setup-guide
-bash scripts/sno-enable-all-features-35.sh
-```
-
 > **Tip:** In Web Terminal, RHCL/Service Mesh installation (Step 6) may briefly disconnect your session. If this happens, operators continue installing via OLM in the background. Reconnect and re-run the script -- completed steps are skipped.
 
 > **Sample output:** [sno-all-features-output.txt](sample-output/sno-all-features-output.txt)
@@ -149,12 +131,6 @@ After Script 1 completes (all operators installed and verified):
 
 ```bash
 curl -sL https://raw.githubusercontent.com/jingggg-wenn/rhoai-sno-setup-guide/main/scripts/sno-setup-maas-35.sh | bash
-```
-
-Or if you cloned the repo:
-
-```bash
-bash scripts/sno-setup-maas-35.sh
 ```
 
 Options:
@@ -175,8 +151,6 @@ Once both scripts complete:
 3. Select a model and deploy with the **llm-d** runtime for MaaS integration
 4. Register a subscription and auth policy via the Dashboard
 
-
-
 ### Step 7: Verify MaaS endpoint
 
 ```bash
@@ -194,8 +168,6 @@ curl -sk https://maas.${CLUSTER_DOMAIN}/v1/models -H "Authorization: Bearer $TOK
 - **Non-streaming chat/completions via MaaS gateway** may return empty (0-byte) responses. This is caused by the `ext_proc` filter's `FULL_DUPLEX_STREAMED` response body mode conflicting with single-body (non-streaming) responses. Streaming (`stream: true`) works correctly. The Playground uses streaming by default and is not affected.
 
 ---
-
-
 
 ## Verification Commands
 
