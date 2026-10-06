@@ -25,20 +25,20 @@ Run these from a local terminal after logging in with `oc login`.
 Creates workshop user accounts with htpasswd authentication.
 
 ```bash
-bash create_workshop_users.sh                  # creates user01..user20 (default)
-bash create_workshop_users.sh --num-users=5    # creates user01..user05
-bash create_workshop_users.sh --num-users=50   # creates user01..user50
+bash create_workshop_users.sh                  # creates user1..user20 (default)
+bash create_workshop_users.sh --num-users=5    # creates user1..user5
+bash create_workshop_users.sh --num-users=50   # creates user1..user50
 ```
 
 
 | Argument          | Default | Description                                     |
 | ----------------- | ------- | ----------------------------------------------- |
-| `--num-users=<N>` | 20      | Number of users to create (`user01` .. `userN`) |
+| `--num-users=<N>` | 20      | Number of users to create (`user1` .. `userN`) |
 
 
 What it does:
 
-- Generates users (`user01` through `userN`) with password `openshift`
+- Generates users (`user1` through `userN`) with password `openshift`
 - Sets up htpasswd as an identity provider on the OAuth cluster resource (preserves existing IDPs)
 - Grants `cluster-admin` RBAC to each user
 - Adds all users to the `rhods-admins` group for RHOAI dashboard admin access
