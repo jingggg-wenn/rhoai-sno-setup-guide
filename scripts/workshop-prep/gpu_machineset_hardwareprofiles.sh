@@ -1,6 +1,6 @@
 #!/bin/bash
 ###############################################################################
-# gpu_installation.sh
+# gpu_machineset_hardwareprofiles.sh
 #
 # Create a GPU MachineSet (g6.2xlarge / NVIDIA L4) and configure the
 # gpu-profile HardwareProfile with tolerations and nodeSelectors.
@@ -17,7 +17,7 @@
 #   - oc login completed with cluster-admin privileges
 #   - Cluster running on AWS with at least one existing worker MachineSet
 #   - RHOAI installed (for HardwareProfile patching)
-#   - python3 and PyYAML available (for MachineSet YAML generation)
+#   - python3 available (for MachineSet JSON generation)
 ###############################################################################
 set -euo pipefail
 
@@ -80,9 +80,9 @@ else
             TAGS_JSON=$(oc get machineset "$EXISTING_MS" -n openshift-machine-api \
                 -o jsonpath='{.spec.template.spec.providerSpec.value.tags}' 2>/dev/null)
 
-            # Build the MachineSet YAML using python for reliable JSON embedding
+            # Build the MachineSet JSON using python for reliable embedding
             python3 -c "
-import json, yaml, sys
+import json, sys
 
 infra_id = '${INFRA_ID}'
 ms_name = '${GPU_MS_NAME}'
@@ -178,7 +178,7 @@ ms = {
     },
 }
 
-yaml.dump(ms, sys.stdout, default_flow_style=False)
+json.dump(ms, sys.stdout, indent=2)
 " | oc apply -f -
 
             success "GPU MachineSet created: $GPU_MS_NAME (replicas=0)"
