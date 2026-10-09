@@ -308,6 +308,7 @@ else
 fi
 # Label as Data Science Project (idempotent)
 oc label namespace demo opendatahub.io/dashboard=true --overwrite 2>/dev/null || true
+oc label namespace demo opendatahub.io/generated-namespace=true --overwrite 2>/dev/null || true
 success "demo labeled as Data Science Project"
 
 # Wait for MLflow CRD (registered after mlflowoperator becomes Managed)
@@ -480,6 +481,48 @@ EOF
 else
     warn "MLflow CRD not available — MLflow will be created on next run"
 fi
+
+# --- Step 3b: MLflow client ConfigMaps for demo apps ---
+# Pre-creates shared MLflow client configuration so that demo apps
+# (Open WebUI, Inference Planner, etc.) get tracing for free via
+# envFrom: configMapRef without knowing MLflow details.
+info "Creating MLflow client ConfigMaps in demo..."
+oc apply -f - <<'MLCEOF'
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mlflow-client-env
+  namespace: demo
+data:
+  MLFLOW_TRACKING_URI: "https://mlflow.redhat-ods-applications.svc:8443/mlflow"
+  MLFLOW_TRACKING_INSECURE_TLS: "true"
+  VERIFY_SSL: "false"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mlflow-autolog-init
+  namespace: demo
+data:
+  sitecustomize.py: |
+    import os
+    if os.getenv("MLFLOW_TRACKING_URI"):
+        try:
+            import mlflow, ssl, urllib3
+            urllib3.disable_warnings()
+            os.environ.setdefault("REQUESTS_CA_BUNDLE", "")
+            ssl._create_default_https_context = ssl._create_unverified_context
+            mlflow.set_tracking_uri(os.environ["MLFLOW_TRACKING_URI"])
+            mlflow.set_experiment(os.getenv("MLFLOW_EXPERIMENT_NAME", "default"))
+            mlflow.openai.autolog()
+            try:
+                mlflow.langchain.autolog()
+            except Exception:
+                pass
+        except ImportError:
+            pass
+MLCEOF
+success "MLflow client ConfigMaps created (mlflow-client-env + mlflow-autolog-init)"
 echo ""
 
 # --- EvalHub (TrustyAI Operator CR) ---
