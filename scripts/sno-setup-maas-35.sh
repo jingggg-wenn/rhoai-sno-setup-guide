@@ -91,6 +91,16 @@ if ! oc whoami &>/dev/null; then
 fi
 success "Logged in: $(oc whoami) @ $(oc whoami --show-server)"
 
+# Clean up Completed/Error pods to free pod slots on SNO (max 250 pods per node)
+STALE_PODS=$( (oc get pods -A --field-selector=status.phase==Succeeded --no-headers 2>/dev/null; \
+              oc get pods -A --field-selector=status.phase==Failed --no-headers 2>/dev/null) | wc -l | tr -d ' ')
+if [ "${STALE_PODS:-0}" -gt 0 ]; then
+    info "Cleaning up $STALE_PODS Completed/Failed pods to free pod slots..."
+    oc delete pods -A --field-selector=status.phase==Succeeded 2>/dev/null || true
+    oc delete pods -A --field-selector=status.phase==Failed 2>/dev/null || true
+    success "Stale pods cleaned up ✓"
+fi
+
 RHOAI_CSV=$(oc get csv -n redhat-ods-operator --no-headers 2>/dev/null | grep rhods | awk '{print $1}')
 if [ -z "$RHOAI_CSV" ]; then
     error "RHOAI Operator not installed"

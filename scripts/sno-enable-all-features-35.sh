@@ -523,6 +523,24 @@ data:
             pass
 MLCEOF
 success "MLflow client ConfigMaps created (mlflow-client-env + mlflow-autolog-init)"
+
+# Create a non-expiring SA token secret for MLflow authentication
+# (kubernetes.io/service-account-token type tokens persist until the secret is deleted)
+if ! oc get secret mlflow-sa-token -n demo &>/dev/null 2>&1; then
+    oc apply -n demo -f - <<'SATEOF'
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mlflow-sa-token
+  namespace: demo
+  annotations:
+    kubernetes.io/service-account.name: default
+type: kubernetes.io/service-account-token
+SATEOF
+    success "MLflow SA token secret created"
+else
+    success "MLflow SA token secret exists ✓"
+fi
 echo ""
 
 # --- EvalHub (TrustyAI Operator CR) ---
