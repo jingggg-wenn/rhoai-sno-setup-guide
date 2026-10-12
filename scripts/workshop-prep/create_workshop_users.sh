@@ -228,6 +228,15 @@ for i in $(seq -w 1 "$USER_COUNT"); do
     fi
 done
 
+# Also add the original Keycloak admin user to the group
+if echo "$CURRENT_MEMBERS" | grep -q '"admin"'; then
+    info "admin already in $GROUP_NAME"
+else
+    oc adm groups add-users "$GROUP_NAME" "admin" &>/dev/null
+    GROUP_ADDED=$((GROUP_ADDED + 1))
+    info "Added Keycloak 'admin' user to $GROUP_NAME"
+fi
+
 success "$GROUP_NAME membership: $GROUP_ADDED added, $GROUP_EXISTED already members"
 echo ""
 
