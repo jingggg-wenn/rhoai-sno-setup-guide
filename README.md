@@ -1,7 +1,7 @@
 # RHOAI 3.5 SNO Setup Guide
 
 Created: 29 Sep 2026
-Last modified: 06 Oct 2026
+Last modified: 20 Oct 2026
 
 **한국어 가이드는 [여기](README_KR.md)를 참고하세요.**
 
@@ -74,6 +74,10 @@ Optional scripts for preparing the cluster for a multi-user workshop. Run from a
 | `create_workshop_users.sh` | Creates htpasswd users (`user01`..`userN`) with cluster-admin RBAC and `rhods-admins` group membership. Supports `--num-users=<N>` (default: 20). |
 | `gpu_machineset_hardwareprofiles.sh` | Creates a GPU MachineSet (`g6.2xlarge`, replicas=0) and patches the `gpu-profile` HardwareProfile with nodeSelector + toleration. No Kueue dependency. |
 
+### Script 3: `add-worker-node.sh`
+
+Adds a worker node (default: `m6a.4xlarge` -- 16 vCPU, 64 GiB RAM) to alleviate resource pressure on the SNO master node. On SNO clusters, all workloads run on the single master which can hit pod limits (250) or memory pressure. Adding a worker node offloads user workloads (workbenches, model serving, pipelines).
+
 See [`scripts/workshop-prep/README.md`](scripts/workshop-prep/README.md) for details.
 
 All scripts are **idempotent** -- safe to re-run if interrupted or if operators are still installing in the background.
@@ -142,7 +146,28 @@ Options:
 
 > **Sample output:** [enable-maas-output.txt](sample-output/enable-maas-output.txt)
 
-### Step 6: Deploy a model
+### Step 6: Add worker node (optional)
+
+If the SNO master node is under resource pressure (high pod count, memory pressure), add a worker node to offload user workloads:
+
+```bash
+curl -sL https://raw.githubusercontent.com/jingggg-wenn/rhoai-sno-setup-guide/main/scripts/add-worker-node.sh | bash
+```
+
+This auto-detects the cluster's AWS region, AZ, and AMI from the master node and creates a `m6a.4xlarge` worker MachineSet. The node takes approximately 5-10 minutes to provision and join.
+
+To preview without applying:
+
+```bash
+curl -sL https://raw.githubusercontent.com/jingggg-wenn/rhoai-sno-setup-guide/main/scripts/add-worker-node.sh | bash -s -- --dry-run
+```
+
+> **Cost note:** `m6a.4xlarge` costs approximately $0.69/hr (us-east-1). Scale to 0 when not needed:
+> ```bash
+> oc scale machineset <name> -n openshift-machine-api --replicas=0
+> ```
+
+### Step 7: Deploy a model
 
 Once both scripts complete:
 
@@ -151,7 +176,7 @@ Once both scripts complete:
 3. Select a model and deploy with the **llm-d** runtime for MaaS integration
 4. Register a subscription and auth policy via the Dashboard
 
-### Step 7: Verify MaaS endpoint
+### Step 8: Verify MaaS endpoint
 
 ```bash
 TOKEN=$(oc whoami -t)

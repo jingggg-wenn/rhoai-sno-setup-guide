@@ -1,7 +1,7 @@
 # RHOAI 3.5 SNO 설정 가이드
 
 작성일: 29 Sep 2026
-최종 수정: 06 Oct 2026
+최종 수정: 20 Oct 2026
 
 Single Node OpenShift (SNO) 클러스터에서 Red Hat OpenShift AI 3.5의 모든 기능을 스크립트 하나로 활성화합니다. Models-as-a-Service (MaaS), 관측성(Observability), 평가 도구(Evaluation tooling)를 포함합니다.
 
@@ -71,6 +71,10 @@ MaaS 인프라를 구성합니다:
 |---|---|
 | `create_workshop_users.sh` | htpasswd 사용자(`user01`..`userN`) 생성, cluster-admin RBAC 및 `rhods-admins` 그룹 멤버십 부여. `--num-users=<N>` 옵션 지원 (기본값: 20). |
 | `gpu_machineset_hardwareprofiles.sh` | GPU MachineSet(`g6.2xlarge`, replicas=0) 생성 및 `gpu-profile` HardwareProfile에 nodeSelector + toleration 패치. Kueue 불필요. |
+
+### 스크립트 3: `add-worker-node.sh`
+
+SNO 마스터 노드의 리소스 부담을 줄이기 위해 워커 노드(기본: `m6a.4xlarge` -- 16 vCPU, 64 GiB RAM)를 추가합니다. SNO 클러스터에서는 모든 워크로드가 단일 마스터 노드에서 실행되어 Pod 제한(250개) 또는 메모리 부족이 발생할 수 있습니다. 워커 노드를 추가하면 사용자 워크로드(워크벤치, 모델 서빙, 파이프라인)를 분산할 수 있습니다.
 
 자세한 내용은 [`scripts/workshop-prep/README.md`](scripts/workshop-prep/README.md)를 참조하세요.
 
@@ -159,7 +163,28 @@ bash scripts/sno-setup-maas-35.sh
 
 > **실행 결과 예시:** [enable-maas-output.txt](sample-output/enable-maas-output.txt)
 
-### 6단계: 모델 배포
+### 6단계: 워커 노드 추가 (선택 사항)
+
+SNO 마스터 노드에 리소스 부담이 있는 경우(높은 Pod 수, 메모리 부족) 워커 노드를 추가하여 사용자 워크로드를 분산합니다:
+
+```bash
+curl -sL https://raw.githubusercontent.com/jingggg-wenn/rhoai-sno-setup-guide/main/scripts/add-worker-node.sh | bash
+```
+
+클러스터의 AWS 리전, AZ, AMI를 마스터 노드에서 자동 감지하여 `m6a.4xlarge` 워커 MachineSet을 생성합니다. 노드 프로비저닝 및 조인에 약 5-10분이 소요됩니다.
+
+적용하지 않고 미리보기:
+
+```bash
+curl -sL https://raw.githubusercontent.com/jingggg-wenn/rhoai-sno-setup-guide/main/scripts/add-worker-node.sh | bash -s -- --dry-run
+```
+
+> **비용 참고:** `m6a.4xlarge`는 약 $0.69/hr (us-east-1) 입니다. 사용하지 않을 때는 0으로 스케일 다운하세요:
+> ```bash
+> oc scale machineset <name> -n openshift-machine-api --replicas=0
+> ```
+
+### 7단계: 모델 배포
 
 두 스크립트가 모두 완료되면:
 
@@ -168,7 +193,7 @@ bash scripts/sno-setup-maas-35.sh
 3. 모델을 선택하고 MaaS 통합을 위해 **llm-d** 런타임으로 배포
 4. Dashboard에서 Subscription 및 Auth Policy 등록
 
-### 7단계: MaaS 엔드포인트 확인
+### 8단계: MaaS 엔드포인트 확인
 
 ```bash
 TOKEN=$(oc whoami -t)
