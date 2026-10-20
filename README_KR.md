@@ -29,6 +29,8 @@ Single Node OpenShift (SNO) 클러스터에서 Red Hat OpenShift AI 3.5의 모�
 
 RHDP 데모 환경에는 GPU 노드가 이미 프로비저닝되어 있습니다. 이는 단일 모델 배포에 충분합니다. 여러 모델을 동시에 배포해야 하는 경우 추가 GPU MachineSet을 생성하여 GPU 용량을 확보해야 합니다.
 
+> **참고:** 데모 카탈로그 클러스터에는 `my-first-model`이 이미 배포되어 있으며 단일 GPU를 점유하고 있습니다. 새 모델을 배포하려면 먼저 이 모델을 중지해야 합니다. 그렇지 않으면 GPU 리소스 부족으로 새 모델이 대기 상태로 유지됩니다. **Gen AI Studio** > **Models**에서 `my-first-model`을 삭제하거나 스케일 다운하세요. 또는 [`gpu_machineset_hardwareprofiles.sh`](scripts/workshop-prep/gpu_machineset_hardwareprofiles.sh)를 사용하여 추가 GPU MachineSet을 생성할 수 있습니다.
+
 ---
 
 ## 구성 내용
@@ -121,22 +123,7 @@ Web Terminal(또는 `oc login`이 완료된 터미널)에서:
 curl -sL https://raw.githubusercontent.com/jingggg-wenn/rhoai-sno-setup-guide/main/scripts/sno-enable-all-features-35.sh | bash
 ```
 
-또는 리포지토리를 클론하여 로컬에서 실행:
-
-```bash
-git clone https://github.com/jingggg-wenn/rhoai-sno-setup-guide.git
-cd rhoai-sno-setup-guide
-bash scripts/sno-enable-all-features-35.sh
-```
-
 > **참고:** Web Terminal에서 RHCL/Service Mesh 설치(6단계) 시 세션이 일시적으로 끊길 수 있습니다. 이 경우 OLM이 백그라운드에서 오퍼레이터 설치를 계속 진행합니다. 재접속 후 스크립트를 다시 실행하면 완료된 단계는 건너뜁니다.
->
-> 중단 없이 실행하려면:
->
-> ```bash
-> nohup bash scripts/sno-enable-all-features-35.sh > /tmp/sno.log 2>&1 &
-> tail -f /tmp/sno.log
-> ```
 
 > **실행 결과 예시:** [sno-all-features-output.txt](sample-output/sno-all-features-output.txt)
 
@@ -146,12 +133,6 @@ bash scripts/sno-enable-all-features-35.sh
 
 ```bash
 curl -sL https://raw.githubusercontent.com/jingggg-wenn/rhoai-sno-setup-guide/main/scripts/sno-setup-maas-35.sh | bash
-```
-
-또는 리포지토리를 클론한 경우:
-
-```bash
-bash scripts/sno-setup-maas-35.sh
 ```
 
 옵션:
@@ -192,6 +173,8 @@ curl -sL https://raw.githubusercontent.com/jingggg-wenn/rhoai-sno-setup-guide/ma
 2. **Gen AI Studio** > **Deploy**로 이동
 3. 모델을 선택하고 MaaS 통합을 위해 **llm-d** 런타임으로 배포
 4. Dashboard에서 Subscription 및 Auth Policy 등록
+
+> **참고:** `my-first-model`이 아직 실행 중이라면 먼저 중지하여 GPU를 확보하세요. 그렇지 않으면 새 모델이 대기 상태로 유지됩니다. 또는 [`gpu_machineset_hardwareprofiles.sh`](scripts/workshop-prep/gpu_machineset_hardwareprofiles.sh)를 사용하여 추가 GPU MachineSet을 생성할 수 있습니다.
 
 ### 8단계: MaaS 엔드포인트 확인
 

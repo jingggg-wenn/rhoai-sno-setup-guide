@@ -31,6 +31,8 @@ Instead of manually configuring dozens of operators, dashboard flags, CRDs, and 
 
 The RHDP demo environment comes with a GPU node already provisioned. This is sufficient for deploying a single model. If you need to deploy additional models concurrently, you may need to create additional GPU MachineSets to provide more GPU capacity.
 
+> **Note:** The demo catalog cluster comes with `my-first-model` already deployed and consuming the single available GPU. You must stop this model before deploying a new one, otherwise the new model will remain pending due to insufficient GPU resources. To stop it, go to **Gen AI Studio** > **Models** and delete or scale down `my-first-model`. Alternatively, create additional GPU MachineSets using [`gpu_machineset_hardwareprofiles.sh`](scripts/workshop-prep/gpu_machineset_hardwareprofiles.sh) to add more capacity.
+
 ---
 
 ## What Gets Configured
@@ -175,6 +177,8 @@ Once both scripts complete:
 2. Go to **Gen AI Studio** > **Deploy**
 3. Select a model and deploy with the **llm-d** runtime for MaaS integration
 4. Register a subscription and auth policy via the Dashboard
+
+> **Reminder:** If `my-first-model` is still running, stop it first to free the GPU. Otherwise your new model will remain pending. Alternatively, create additional GPU MachineSets using [`gpu_machineset_hardwareprofiles.sh`](scripts/workshop-prep/gpu_machineset_hardwareprofiles.sh).
 
 ### Step 8: Verify MaaS endpoint
 
