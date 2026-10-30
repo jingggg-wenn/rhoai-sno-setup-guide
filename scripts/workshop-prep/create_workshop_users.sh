@@ -1,5 +1,10 @@
 #!/bin/bash
 ###############################################################################
+# NOTE: This is an older version that creates users via htpasswd IDP.
+# For environments with Keycloak-provisioned users, use
+# setup_workshop_users_rbac.sh instead.
+###############################################################################
+#
 # create_workshop_users.sh
 #
 # Create workshop users (user01-user20) with htpasswd IDP,
