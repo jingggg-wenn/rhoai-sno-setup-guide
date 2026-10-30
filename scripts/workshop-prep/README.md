@@ -86,6 +86,21 @@ bash ../add-worker-node.sh --replicas 2                      # two worker nodes
 bash ../add-worker-node.sh --dry-run                         # preview without applying
 ```
 
+### 4. deploy-showroom.sh (optional)
+
+Deploy workshop content from a Git repository to Showroom on an existing OpenShift cluster.
+
+Requires `oc` login and permission to create namespaces and workloads.
+
+```bash
+export GIT_URL="https://github.com/jingggg-wenn/rhoai-basic-inference-workshop.git"
+export GIT_REF="main"           # branch or tag
+export CONTENT_PATH="content"   # directory containing antora.yml
+
+bash ./deploy-showroom.sh
+```
+
+
 ## Run Order
 
 Run the scripts in the order listed above. User accounts (+ worker node) should
