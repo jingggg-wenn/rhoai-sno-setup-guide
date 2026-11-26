@@ -1,7 +1,7 @@
 # RHOAI 3.5 SNO Setup Guide
 
 Created: 29 Sep 2026
-Last modified: 20 Oct 2026
+Last modified: 26 Nov 2026
 
 **한국어 가이드는 [여기](README_KR.md)를 참고하세요.**
 
@@ -9,13 +9,13 @@ Single-script enablement of all Red Hat OpenShift AI 3.5 features on a Single No
 
 - **Repository:** [https://github.com/jingggg-wenn/rhoai-sno-setup-guide](https://github.com/jingggg-wenn/rhoai-sno-setup-guide)
 - **Upstream source:** [https://github.com/hyogrin/RHOAI-Toolkit](https://github.com/hyogrin/RHOAI-Toolkit) (tracked as `upstream` remote)
-- **Tested on:** RHOAI v3.5.1 (Sep 2026)
+- **Tested on:** RHOAI v3.5.2 (Nov 2026)
 
 ---
 
 ## Disclaimer
 
-This is an **unofficial** setup script, not maintained or endorsed by Red Hat. It is tested and maintained on a version-specific basis (currently RHOAI 3.5.1) and may not work on other versions without modification. Use at your own discretion.
+This is an **unofficial** setup script, not maintained or endorsed by Red Hat. It is tested and maintained on a version-specific basis (currently RHOAI 3.5.2) and may not work on other versions without modification. Use at your own discretion.
 
 ---
 
@@ -39,21 +39,24 @@ The RHDP demo environment comes with a GPU node already provisioned. This is suf
 
 ### Script 1: `sno-enable-all-features-35.sh`
 
-Enables all RHOAI 3.5 DSC components and dashboard features:
+Enables all RHOAI 3.5 DSC components, dashboard features, and supporting operators. Operators are installed first, then DSCI/DSC are configured. RHCL (which may briefly disrupt the network) is installed last, after all configuration is saved.
 
 | Step | What it does |
 |------|---|
-| 1 | User Workload Monitoring |
-| 2 | DSC component activation (MLflow, OGX, AIGateway, MaaS) |
-| 3 | MLflow server + EvalHub + demo Data Science Project |
-| 4 | MaaS Gateway (GatewayClass + Gateway CRs) |
-| 5 | Dashboard menu activation (all feature flags) |
-| 5b | Accelerator metrics recording rules (GPU Operator prerequisite) |
-| 5c | Red Hat OpenShift Dev Spaces (operator + CheCluster) |
-| 6 | Operator install (Kueue, cert-manager, LWS, OpenTelemetry, Tempo, COO, RHCL) |
-| 7 | DSCI observability (metrics, traces, MonitoringStack, Perses) + Kuadrant CR + UIPlugins |
-| 8 | Dashboard restart |
-| 9 | Verification |
+| 1 | Prerequisites check |
+| 2 | User Workload Monitoring |
+| 3a | Operator install (NFD, NVIDIA GPU, cert-manager, LWS, OpenTelemetry, Tempo, COO, Dev Spaces) + Web Terminal (skipped if present) |
+| 3b | Post-install CRs (NodeFeatureDiscovery, ClusterPolicy, LWS, UIPlugins, CheCluster) |
+| 4 | DSCI merge patch (metrics, traces, MonitoringStack, Perses) |
+| 5 | DSC merge patch (all components; Kueue and Trainer set to `Removed`) |
+| 6 | MLflow server + EvalHub + demo Data Science Project |
+| 7 | MaaS Gateway (GatewayClass + Gateway CRs) |
+| 8 | Dashboard menu activation (all feature flags) + accelerator metrics recording rules |
+| 9 | RHCL install + Kuadrant CR + Authorino TLS (may briefly disrupt Web Terminal) |
+| 10 | Dashboard restart |
+| 11 | Verification (flags NOT READY items) |
+
+> **Note:** Kueue is no longer installed, and Trainer / the Training Jobs dashboard menu are disabled (Trainer needs the JobSet operator, which is not installed).
 
 ### Script 2: `sno-setup-maas-35.sh`
 
@@ -127,7 +130,7 @@ From the Web Terminal (or any terminal with `oc login` completed):
 curl -sL https://raw.githubusercontent.com/jingggg-wenn/rhoai-sno-setup-guide/main/scripts/sno-enable-all-features-35.sh | bash
 ```
 
-> **Tip:** In Web Terminal, RHCL/Service Mesh installation (Step 6) may briefly disconnect your session. If this happens, operators continue installing via OLM in the background. Reconnect and re-run the script -- completed steps are skipped.
+> **Tip:** In Web Terminal, RHCL/Service Mesh installation (Step 9) may briefly disconnect your session. If this happens, operators continue installing via OLM in the background. Reconnect and re-run the script -- completed steps are skipped.
 
 > **Sample output:** [sno-all-features-output.txt](sample-output/sno-all-features-output.txt)
 
@@ -192,7 +195,7 @@ curl -sk https://maas.${CLUSTER_DOMAIN}/v1/models -H "Authorization: Bearer $TOK
 
 
 
-## Known Issues (RHOAI 3.5.1)
+## Known Issues (RHOAI 3.5.2)
 
 - **Non-streaming chat/completions via MaaS gateway** may return empty (0-byte) responses. This is caused by the `ext_proc` filter's `FULL_DUPLEX_STREAMED` response body mode conflicting with single-body (non-streaming) responses. Streaming (`stream: true`) works correctly. The Playground uses streaming by default and is not affected.
 
@@ -208,7 +211,7 @@ oc get csv -n redhat-ods-operator
 oc get datasciencecluster default-dsc
 
 # Operators installed
-oc get csv -A | grep -E "nfd|gpu|kueue|lws|rhcl|rhods|cert-manager|tempo|opentelemetry|observability"
+oc get csv -A | grep -E "nfd|gpu|lws|rhcl|rhods|cert-manager|tempo|opentelemetry|observability|devspaces|web-terminal"
 
 # MaaS gateway
 oc get gateway -n openshift-ingress

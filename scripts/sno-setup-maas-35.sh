@@ -40,7 +40,7 @@
 #   - aigateway + modelsAsAService enabled in DSC
 #   - maas-default-gateway created
 #
-# Tip: Run sno-enable-all-features.sh first to ensure all prerequisites.
+# Tip: Run sno-enable-all-features-35.sh first to ensure all prerequisites.
 ###############################################################################
 set -euo pipefail
 
@@ -72,8 +72,56 @@ success() { echo -e "${GREEN}[OK]${NC}   $*"; }
 warn()    { echo -e "${YELLOW}[WARN]${NC} $*"; }
 error()   { echo -e "${RED}[ERR]${NC}  $*"; }
 
+###############################################################################
+# wait_for  --  visual progress bar with spinner
+#   Usage:  wait_for <timeout_sec> "<label>" <check_command ...>
+#   The check_command runs in a subprocess (bash -c) each iteration.
+#   Returns 0 when check passes, or 1 if timeout is reached.
+###############################################################################
+wait_for() {
+    local timeout="$1"
+    local label="$2"
+    shift 2
+    local check_cmd="$*"
+
+    local elapsed=0
+    local interval=5
+    local spin_chars='|/-\'
+    local spin_idx=0
+    local bar_width=30
+
+    while [ $elapsed -lt "$timeout" ]; do
+        if bash -c "$check_cmd" &>/dev/null; then
+            printf '\r%-70s\r' " "
+            success "$label"
+            return 0
+        fi
+
+        local pct=$(( elapsed * 100 / timeout ))
+        local filled=$(( pct * bar_width / 100 ))
+        local empty=$(( bar_width - filled ))
+        local spin_char="${spin_chars:$spin_idx:1}"
+        spin_idx=$(( (spin_idx + 1) % 4 ))
+
+        local bar=""
+        for (( _b=0; _b<filled; _b++ )); do bar+="="; done
+        if [ $filled -lt $bar_width ]; then bar+=">"; fi
+        for (( _b=0; _b<empty-1; _b++ )); do bar+=" "; done
+
+        printf '\r  %s [%-*s] %3d%% (%ds/%ds) %s' \
+            "$spin_char" "$bar_width" "$bar" "$pct" "$elapsed" "$timeout" "$label"
+
+        sleep "$interval"
+        elapsed=$((elapsed + interval))
+    done
+
+    printf '\r%-70s\r' " "
+    warn "$label -- timeout after ${timeout}s"
+    return 1
+}
+
 echo "=============================================="
-echo " RHOAI 3.5 SNO — MaaS Setup"
+echo " RHOAI 3.5.2 SNO — MaaS Setup"
 echo "=============================================="
 echo ""
 
@@ -91,7 +139,7 @@ if ! oc whoami &>/dev/null; then
 fi
 success "Logged in: $(oc whoami) @ $(oc whoami --show-server)"
 
-# Clean up Completed/Error pods to free pod slots on SNO (max 250 pods per node)
+# Clean up Completed/Error pods to free pod slots
 STALE_PODS=$( (oc get pods -A --field-selector=status.phase==Succeeded --no-headers 2>/dev/null; \
               oc get pods -A --field-selector=status.phase==Failed --no-headers 2>/dev/null) | wc -l | tr -d ' ')
 if [ "${STALE_PODS:-0}" -gt 0 ]; then
@@ -109,11 +157,11 @@ fi
 success "RHOAI: $(echo "$RHOAI_CSV" | sed 's/rhods-operator\.//')"
 
 # Check RHCL
-if oc get subscription -A --no-headers 2>/dev/null | grep -q "rhcl-operator"; then
+if bash -c 'oc get subscription -A --no-headers 2>/dev/null | grep -q "rhcl-operator"'; then
     success "RHCL operator ✓"
 else
     error "RHCL operator not installed"
-    echo "  Run: bash sno-enable-all-features.sh first"
+    echo "  Run: bash sno-enable-all-features-35.sh first"
     exit 1
 fi
 
@@ -122,7 +170,7 @@ AIGATEWAY=$(oc get datasciencecluster default-dsc \
   -o jsonpath='{.spec.components.aigateway.managementState}' 2>/dev/null)
 if [ "$AIGATEWAY" != "Managed" ]; then
     error "AIGateway not enabled in DSC (current: ${AIGATEWAY:-unset})"
-    echo "  Run: bash sno-enable-all-features.sh first"
+    echo "  Run: bash sno-enable-all-features-35.sh first"
     exit 1
 fi
 success "AIGateway: Managed ✓"
@@ -132,25 +180,21 @@ if oc get gateway maas-default-gateway -n openshift-ingress &>/dev/null 2>&1; th
     success "maas-default-gateway ✓"
 else
     error "maas-default-gateway not found in openshift-ingress"
-    echo "  Run: bash sno-enable-all-features.sh first"
+    echo "  Run: bash sno-enable-all-features-35.sh first"
     exit 1
 fi
 
 # Ensure MaaS infra namespace exists
 if ! oc get ns "$MAAS_INFRA_NS" &>/dev/null 2>&1; then
     warn "$MAAS_INFRA_NS namespace not found — will be created by operator"
-    info "Waiting for $MAAS_INFRA_NS namespace (up to 120s)..."
-    WAIT=0
-    while [ $WAIT -lt 120 ]; do
-        oc get ns "$MAAS_INFRA_NS" &>/dev/null 2>&1 && break
-        sleep 5; WAIT=$((WAIT + 5))
-    done
-    if ! oc get ns "$MAAS_INFRA_NS" &>/dev/null 2>&1; then
+    if ! wait_for 120 "Namespace: $MAAS_INFRA_NS" \
+        "oc get ns $MAAS_INFRA_NS"; then
         error "$MAAS_INFRA_NS namespace not created. Ensure aigateway is Managed in DSC."
         exit 1
     fi
+else
+    success "Namespace: $MAAS_INFRA_NS ✓"
 fi
-success "Namespace: $MAAS_INFRA_NS ✓"
 
 ###############################################################################
 # Patch openshift-ai-inference Gateway
@@ -310,13 +354,8 @@ EOF
     fi
     unset PG_PASSWORD
 
-    info "Waiting for PostgreSQL..."
-    WAIT=0
-    while [ $WAIT -lt 120 ]; do
-        oc rollout status deployment/postgres -n "$PG_DEPLOY_NS" --timeout=5s &>/dev/null && break
-        sleep 5; WAIT=$((WAIT + 5))
-    done
-    success "PostgreSQL ready"
+    wait_for 120 "PostgreSQL ready" \
+        "oc rollout status deployment/postgres -n $PG_DEPLOY_NS --timeout=5s"
 
     # Build DB URL with FQDN (cross-namespace resolution)
     PG_PASSWORD_ACTUAL=$(oc get deployment postgres -n "$PG_DEPLOY_NS" \
@@ -374,28 +413,9 @@ info "=== Step 2/5: Kuadrant + Authorino TLS (kuadrant-system) ==="
 KUADRANT_NS="kuadrant-system"
 
 # --- 2a. Wait for all RHCL sub-operator CSVs to be Succeeded ---
-info "Waiting for RHCL sub-operators to be ready..."
-WAIT=0
-while [ $WAIT -lt 180 ]; do
-    ALL_READY=true
-    for SUB_OP in authorino-operator limitador-operator; do
-        CSV_PHASE=$(oc get csv -n redhat-connectivity-link-operator --no-headers 2>/dev/null \
-            | grep "$SUB_OP" | awk '{print $NF}')
-        if [ "$CSV_PHASE" != "Succeeded" ]; then
-            ALL_READY=false
-            break
-        fi
-    done
-    if [ "$ALL_READY" = true ]; then
-        success "All RHCL sub-operators ready (Authorino, Limitador)"
-        break
-    fi
-    sleep 10; WAIT=$((WAIT + 10))
-    [ $((WAIT % 30)) -eq 0 ] && info "  still waiting for sub-operators... (${WAIT}s)"
-done
-if [ "$ALL_READY" != true ]; then
-    warn "Sub-operators not all ready after 180s — proceeding anyway"
-fi
+wait_for 180 "RHCL sub-operators ready (Authorino, Limitador)" \
+    'oc get csv -n redhat-connectivity-link-operator --no-headers 2>/dev/null | grep "authorino-operator" | grep -q Succeeded && oc get csv -n redhat-connectivity-link-operator --no-headers 2>/dev/null | grep "limitador-operator" | grep -q Succeeded' \
+    || true
 
 # --- 2b. Create Kuadrant CR in kuadrant-system ---
 oc create namespace "$KUADRANT_NS" 2>/dev/null || true
@@ -415,36 +435,27 @@ fi
 # NOTE: Kuadrant operator checks dependencies at startup and caches the result.
 # OLM-managed deployments ignore rollout restart (OLM reverts the change).
 # Recovery requires: delete CR → delete pod directly → recreate CR.
-info "Waiting for Kuadrant to become Ready (up to 120s)..."
-WAIT=0
-KUADRANT_READY=false
-while [ $WAIT -lt 120 ]; do
-    KSTATUS=$(oc get kuadrant kuadrant -n "$KUADRANT_NS" \
-        -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)
-    if [ "$KSTATUS" = "True" ]; then
-        KUADRANT_READY=true
-        break
-    fi
+#
+# First attempt: simple wait with progress bar
+if ! wait_for 30 "Kuadrant Ready in $KUADRANT_NS" \
+    'oc get kuadrant kuadrant -n '"$KUADRANT_NS"' -o jsonpath='"'"'{.status.conditions[?(@.type=="Ready")].status}'"'"' 2>/dev/null | grep -q True'; then
 
-    # At 30s: if stuck on MissingDependency, do full recovery cycle
-    if [ $WAIT -eq 30 ] && [ "$KSTATUS" != "True" ]; then
-        KREASON=$(oc get kuadrant kuadrant -n "$KUADRANT_NS" \
-            -o jsonpath='{.status.conditions[?(@.type=="Ready")].reason}' 2>/dev/null || true)
-        if [ "$KREASON" = "MissingDependency" ]; then
-            warn "Kuadrant stuck on MissingDependency — full recovery cycle..."
-            # 1) Delete CR to clear cached state
-            oc delete kuadrant kuadrant -n "$KUADRANT_NS" --timeout=30s 2>/dev/null || true
-            sleep 5
-            # 2) Kill operator pod directly (rollout restart doesn't work with OLM)
-            KPOD=$(oc get pod -n redhat-connectivity-link-operator --no-headers 2>/dev/null \
-                | grep kuadrant-operator-controller-manager | awk '{print $1}')
-            if [ -n "$KPOD" ]; then
-                oc delete pod "$KPOD" -n redhat-connectivity-link-operator 2>/dev/null || true
-                info "Waiting for new operator pod..."
-                sleep 20
-            fi
-            # 3) Recreate CR
-            oc apply -f - <<EOFRECOVERY
+    # Check if stuck on MissingDependency -- full recovery cycle
+    KREASON=$(oc get kuadrant kuadrant -n "$KUADRANT_NS" \
+        -o jsonpath='{.status.conditions[?(@.type=="Ready")].reason}' 2>/dev/null || true)
+    if [ "$KREASON" = "MissingDependency" ]; then
+        warn "Kuadrant stuck on MissingDependency -- recovery cycle..."
+        oc delete kuadrant kuadrant -n "$KUADRANT_NS" --timeout=30s 2>/dev/null || true
+        sleep 5
+        KPOD=$(oc get pod -n redhat-connectivity-link-operator --no-headers 2>/dev/null \
+            | grep kuadrant-operator-controller-manager | awk '{print $1}')
+        if [ -n "$KPOD" ]; then
+            oc delete pod "$KPOD" -n redhat-connectivity-link-operator 2>/dev/null || true
+            wait_for 60 "Kuadrant operator pod restarted" \
+                'oc get deployment kuadrant-operator-controller-manager -n redhat-connectivity-link-operator -o jsonpath='"'"'{.status.readyReplicas}'"'"' 2>/dev/null | grep -q 1' \
+                || true
+        fi
+        oc apply -f - <<EOFRECOVERY
 apiVersion: kuadrant.io/v1beta1
 kind: Kuadrant
 metadata:
@@ -452,17 +463,13 @@ metadata:
   namespace: ${KUADRANT_NS}
 spec: {}
 EOFRECOVERY
-            info "Kuadrant CR recreated — waiting for reconciliation..."
-        fi
+        info "Kuadrant CR recreated"
     fi
 
-    sleep 5; WAIT=$((WAIT + 5))
-done
-
-if [ "$KUADRANT_READY" = true ]; then
-    success "Kuadrant Ready in $KUADRANT_NS ✓"
-else
-    warn "Kuadrant not Ready yet — check: oc get kuadrant -n $KUADRANT_NS -o yaml"
+    # Second attempt after recovery
+    wait_for 90 "Kuadrant Ready in $KUADRANT_NS" \
+        'oc get kuadrant kuadrant -n '"$KUADRANT_NS"' -o jsonpath='"'"'{.status.conditions[?(@.type=="Ready")].status}'"'"' 2>/dev/null | grep -q True' \
+        || warn "Kuadrant not Ready yet -- check: oc get kuadrant -n $KUADRANT_NS -o yaml"
 fi
 
 # Verify both Authorino and Limitador were created
@@ -488,11 +495,8 @@ else
             --overwrite
 
         # Wait for cert
-        WAIT=0
-        while [ $WAIT -lt 60 ]; do
-            oc get secret authorino-server-cert -n "$KUADRANT_NS" &>/dev/null 2>&1 && break
-            sleep 3; WAIT=$((WAIT + 3))
-        done
+        wait_for 60 "Authorino TLS cert generated" \
+            "oc get secret authorino-server-cert -n $KUADRANT_NS" || true
 
         if oc get secret authorino-server-cert -n "$KUADRANT_NS" &>/dev/null 2>&1; then
             # Enable TLS on Authorino listener
@@ -506,15 +510,9 @@ else
                 REQUESTS_CA_BUNDLE=/etc/ssl/certs/openshift-service-ca/service-ca-bundle.crt 2>/dev/null || true
 
             # Wait for Authorino Ready
-            WAIT=0
-            while [ $WAIT -lt 60 ]; do
-                READY=$(oc get authorino authorino -n "$KUADRANT_NS" \
-                    -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)
-                [ "$READY" = "True" ] && break
-                sleep 5; WAIT=$((WAIT + 5))
-            done
-            [ "$READY" = "True" ] && success "Authorino TLS enabled ✓" || \
-                warn "Authorino not fully ready yet (will reconcile in background)"
+            wait_for 60 "Authorino TLS enabled" \
+                'oc get authorino authorino -n '"$KUADRANT_NS"' -o jsonpath='"'"'{.status.conditions[?(@.type=="Ready")].status}'"'"' 2>/dev/null | grep -q True' \
+                || warn "Authorino not fully ready yet (will reconcile in background)"
         else
             warn "TLS cert not generated after 60s — Authorino running without TLS"
         fi
@@ -699,19 +697,9 @@ fi
 ###############################################################################
 info "Restarting maas-api to pick up configuration..."
 oc rollout restart deployment/maas-api -n "$MAAS_INFRA_NS" 2>/dev/null || true
-WAIT=0
-while [ $WAIT -lt 60 ]; do
-    if oc get pods -n "$MAAS_INFRA_NS" --no-headers 2>/dev/null | grep "maas-api" | grep -q "Running"; then
-        READY=$(oc get pods -n "$MAAS_INFRA_NS" -l app=maas-api -o jsonpath='{.items[0].status.containerStatuses[0].ready}' 2>/dev/null || true)
-        [ "$READY" = "true" ] && break
-    fi
-    sleep 5; WAIT=$((WAIT + 5))
-done
-if oc get pods -n "$MAAS_INFRA_NS" --no-headers 2>/dev/null | grep "maas-api" | grep -q "1/1.*Running"; then
-    success "maas-api running ✓"
-else
-    warn "maas-api not fully ready yet — check: oc logs deployment/maas-api -n $MAAS_INFRA_NS"
-fi
+wait_for 60 "maas-api running" \
+    'oc get pods -n "'"$MAAS_INFRA_NS"'" --no-headers 2>/dev/null | grep "maas-api" | grep -q "1/1.*Running"' \
+    || warn "maas-api not fully ready yet -- check: oc logs deployment/maas-api -n $MAAS_INFRA_NS"
 echo ""
 
 ###############################################################################
@@ -734,37 +722,26 @@ if [ "$KUADRANT_REPLICAS" = "0" ]; then
         -n redhat-connectivity-link-operator --timeout=60s 2>/dev/null || true
 fi
 
-# Wait for gateway AuthPolicy to be enforced
-info "Waiting for gateway AuthPolicy to be enforced (up to 90s)..."
-WAIT=0
-while [ $WAIT -lt 90 ]; do
-    ENFORCED=$(oc get authpolicy maas-gateway-auth -n openshift-ingress \
-        -o jsonpath='{.status.conditions[?(@.type=="Enforced")].status}' 2>/dev/null || true)
-    if [ "$ENFORCED" = "True" ]; then
-        success "Gateway AuthPolicy enforced ✓"
-        break
-    fi
-    sleep 10; WAIT=$((WAIT + 10))
+# Wait for gateway AuthPolicy to be enforced (first attempt: 30s)
+if ! wait_for 30 "Gateway AuthPolicy enforced" \
+    'oc get authpolicy maas-gateway-auth -n openshift-ingress -o jsonpath='"'"'{.status.conditions[?(@.type=="Enforced")].status}'"'"' 2>/dev/null | grep -q True'; then
 
     # If stuck on EnvoyFilter sync, delete operator pod to force fresh cache
-    if [ $WAIT -eq 30 ]; then
-        ENFORCED_MSG=$(oc get authpolicy maas-gateway-auth -n openshift-ingress \
-            -o jsonpath='{.status.conditions[?(@.type=="Enforced")].message}' 2>/dev/null || true)
-        if echo "$ENFORCED_MSG" | grep -q "EnvoyFilter"; then
-            warn "EnvoyFilter sync stuck — restarting Kuadrant operator pod..."
-            oc delete pod -n redhat-connectivity-link-operator \
-                -l control-plane=kuadrant-operator --force --grace-period=0 2>/dev/null || true
-            sleep 10
-            oc wait --for=condition=Available \
-                deployment/kuadrant-operator-controller-manager \
-                -n redhat-connectivity-link-operator --timeout=60s 2>/dev/null || true
-        fi
+    ENFORCED_MSG=$(oc get authpolicy maas-gateway-auth -n openshift-ingress \
+        -o jsonpath='{.status.conditions[?(@.type=="Enforced")].message}' 2>/dev/null || true)
+    if echo "$ENFORCED_MSG" | grep -q "EnvoyFilter" 2>/dev/null; then
+        warn "EnvoyFilter sync stuck -- restarting Kuadrant operator pod..."
+        oc delete pod -n redhat-connectivity-link-operator \
+            -l control-plane=kuadrant-operator --force --grace-period=0 2>/dev/null || true
+        wait_for 60 "Kuadrant operator restarted" \
+            'oc wait --for=condition=Available deployment/kuadrant-operator-controller-manager -n redhat-connectivity-link-operator --timeout=5s' \
+            || true
     fi
-done
 
-if [ "$ENFORCED" != "True" ]; then
-    warn "Gateway AuthPolicy not enforced yet — subscription auth may not work immediately"
-    warn "It may take a few minutes for the operator to reconcile"
+    # Second attempt after recovery
+    wait_for 60 "Gateway AuthPolicy enforced" \
+        'oc get authpolicy maas-gateway-auth -n openshift-ingress -o jsonpath='"'"'{.status.conditions[?(@.type=="Enforced")].status}'"'"' 2>/dev/null | grep -q True' \
+        || warn "Gateway AuthPolicy not enforced yet -- it may take a few minutes for the operator to reconcile"
 fi
 echo ""
 
@@ -777,9 +754,13 @@ info "=== Step 5/5: Verification ==="
 if oc get secret maas-db-config -n "$MAAS_INFRA_NS" &>/dev/null; then
     HAS_URL=$(oc get secret maas-db-config -n "$MAAS_INFRA_NS" \
         -o jsonpath='{.data.DB_CONNECTION_URL}' 2>/dev/null)
-    [ -n "$HAS_URL" ] && echo "  ✅ maas-db-config in $MAAS_INFRA_NS" || echo "  ⬚  maas-db-config (missing URL key)"
+    if [ -n "$HAS_URL" ]; then
+        echo -e "  ${GREEN}[OK]${NC} maas-db-config in $MAAS_INFRA_NS"
+    else
+        echo -e "  ${YELLOW}[--]${NC} maas-db-config (missing URL key)"
+    fi
 else
-    echo "  ⬚  maas-db-config NOT FOUND in $MAAS_INFRA_NS"
+    echo -e "  ${YELLOW}[--]${NC} maas-db-config NOT FOUND in $MAAS_INFRA_NS"
 fi
 
 # Authorino TLS (in kuadrant-system)
@@ -788,74 +769,64 @@ TLS_ENABLED=$(oc get authorino authorino -n "$KUADRANT_NS" \
 AUTHORINO_READY=$(oc get authorino authorino -n "$KUADRANT_NS" \
     -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)
 if [ "$TLS_ENABLED" = "true" ] && [ "$AUTHORINO_READY" = "True" ]; then
-    echo "  ✅ Authorino TLS enabled & ready ($KUADRANT_NS)"
+    echo -e "  ${GREEN}[OK]${NC} Authorino TLS enabled & ready ($KUADRANT_NS)"
 elif [ "$TLS_ENABLED" = "true" ]; then
-    echo "  ⬚  Authorino TLS enabled but not ready yet ($KUADRANT_NS)"
+    echo -e "  ${YELLOW}[--]${NC} Authorino TLS enabled but not ready yet ($KUADRANT_NS)"
 else
-    echo "  ⬚  Authorino TLS not enabled ($KUADRANT_NS)"
+    echo -e "  ${YELLOW}[--]${NC} Authorino TLS not enabled ($KUADRANT_NS)"
 fi
 
 # Kuadrant operator
 KUADRANT_READY=$(oc get deployment kuadrant-operator-controller-manager \
     -n redhat-connectivity-link-operator -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
-[ "${KUADRANT_READY:-0}" -ge 1 ] && echo "  ✅ Kuadrant operator running" || echo "  ⬚  Kuadrant operator not ready"
+if [ "${KUADRANT_READY:-0}" -ge 1 ]; then
+    echo -e "  ${GREEN}[OK]${NC} Kuadrant operator running"
+else
+    echo -e "  ${YELLOW}[--]${NC} Kuadrant operator not ready"
+fi
 
 # Gateway AuthPolicy
 ENFORCED=$(oc get authpolicy maas-gateway-auth -n openshift-ingress \
     -o jsonpath='{.status.conditions[?(@.type=="Enforced")].status}' 2>/dev/null || true)
-[ "$ENFORCED" = "True" ] && echo "  ✅ Gateway AuthPolicy enforced" || echo "  ⬚  Gateway AuthPolicy not enforced"
+if [ "$ENFORCED" = "True" ]; then
+    echo -e "  ${GREEN}[OK]${NC} Gateway AuthPolicy enforced"
+else
+    echo -e "  ${YELLOW}[--]${NC} Gateway AuthPolicy not enforced"
+fi
 
 # maas-api
 MAAS_API_RUNNING=$(oc get pods -n "$MAAS_INFRA_NS" --no-headers 2>/dev/null | grep "maas-api" | grep -c "1/1.*Running" || true)
-[ "$MAAS_API_RUNNING" -ge 1 ] && echo "  ✅ maas-api running" || echo "  ⬚  maas-api not running"
+if [ "$MAAS_API_RUNNING" -ge 1 ]; then
+    echo -e "  ${GREEN}[OK]${NC} maas-api running"
+else
+    echo -e "  ${YELLOW}[--]${NC} maas-api not running"
+fi
 
 # rhods-admins group
 CURRENT_USER=$(oc whoami)
-if oc get group rhods-admins -o jsonpath='{.users}' 2>/dev/null | grep -q "\"${CURRENT_USER}\""; then
-    echo "  ✅ ${CURRENT_USER} in rhods-admins group"
+if bash -c 'oc get group rhods-admins -o jsonpath='"'"'{.users}'"'"' 2>/dev/null | grep -q "\"'"${CURRENT_USER}"'\""'; then
+    echo -e "  ${GREEN}[OK]${NC} ${CURRENT_USER} in rhods-admins group"
 else
-    echo "  ⬚  ${CURRENT_USER} NOT in rhods-admins group"
+    echo -e "  ${YELLOW}[--]${NC} ${CURRENT_USER} NOT in rhods-admins group"
 fi
 
-# MaaS Tenant
+# MaaS Tenant (created when first Subscription is registered via Dashboard)
 TENANT_READY=$(oc get tenant default-tenant -n models-as-a-service \
     -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)
 if [ "$TENANT_READY" = "True" ]; then
-    echo "  ✅ MaaS Tenant ready"
+    echo -e "  ${GREEN}[OK]${NC} MaaS Tenant ready"
 else
-    TENANT_MSG=$(oc get tenant default-tenant -n models-as-a-service \
-        -o jsonpath='{.status.conditions[?(@.type=="Ready")].message}' 2>/dev/null || true)
-    echo "  ⬚  MaaS Tenant (${TENANT_MSG:-not found yet — may take a few minutes})"
+    echo -e "  ${YELLOW}[--]${NC} MaaS Tenant (expected -- created after first Subscription via Dashboard)"
 fi
 
-# ModelsAsAServiceReady — poll every 30s until ready (up to 5 min)
-MAAS_STATUS=$(oc get datasciencecluster default-dsc \
-    -o jsonpath='{.status.conditions[?(@.type=="ModelsAsAServiceReady")].status}' 2>/dev/null || true)
-if [ "$MAAS_STATUS" = "True" ]; then
-    echo "  ✅ ModelsAsAServiceReady"
+# ModelsAsAServiceReady -- becomes Ready after MaaS setup completes
+if bash -c 'oc get datasciencecluster default-dsc -o jsonpath='"'"'{.status.conditions[?(@.type=="ModelsAsAServiceReady")].status}'"'"' 2>/dev/null | grep -q True'; then
+    echo -e "  ${GREEN}[OK]${NC} ModelsAsAServiceReady"
 else
-    echo "  ⬚  ModelsAsAServiceReady — waiting for reconciliation..."
-    echo ""
-    info "Polling ModelsAsAServiceReady every 30s (up to 5 min)..."
-    WAIT=0
-    while [ $WAIT -lt 300 ]; do
-        sleep 30; WAIT=$((WAIT + 30))
-        MAAS_STATUS=$(oc get datasciencecluster default-dsc \
-            -o jsonpath='{.status.conditions[?(@.type=="ModelsAsAServiceReady")].status}' 2>/dev/null || true)
-        if [ "$MAAS_STATUS" = "True" ]; then
-            success "ModelsAsAServiceReady ✓ (after ${WAIT}s)"
-            break
-        fi
-        MAAS_REASON=$(oc get datasciencecluster default-dsc \
-            -o jsonpath='{.status.conditions[?(@.type=="ModelsAsAServiceReady")].reason}' 2>/dev/null || true)
-        MAAS_MSG=$(oc get datasciencecluster default-dsc \
-            -o jsonpath='{.status.conditions[?(@.type=="ModelsAsAServiceReady")].message}' 2>/dev/null || true)
-        info "[${WAIT}s] ${MAAS_REASON:-NotReady}: ${MAAS_MSG:-(waiting...)}"
-    done
-    if [ "$MAAS_STATUS" != "True" ]; then
-        warn "ModelsAsAServiceReady still not True after 5 min"
-        warn "Check: oc get datasciencecluster default-dsc -o jsonpath='{.status.conditions[?(@.type==\"ModelsAsAServiceReady\")]}'"
-    fi
+    echo -e "  ${YELLOW}[--]${NC} ModelsAsAServiceReady -- waiting for reconciliation..."
+    wait_for 300 "ModelsAsAServiceReady" \
+        'oc get datasciencecluster default-dsc -o jsonpath='"'"'{.status.conditions[?(@.type=="ModelsAsAServiceReady")].status}'"'"' 2>/dev/null | grep -q True' \
+        || warn "ModelsAsAServiceReady still not True after 5 min -- check DSC status"
 fi
 
 CLUSTER_DOMAIN=$(oc get ingresses.config/cluster -o jsonpath='{.spec.domain}')

@@ -1,63 +1,240 @@
 #!/bin/bash
 ###############################################################################
-# sno-enable-all-features.sh
+# sno-enable-all-features-35.sh
 #
-# Enable all RHOAI 3.5 DSC components + dashboard features on an SNO cluster.
+# Enable all RHOAI 3.5.2 DSC components, dashboard features, and supporting
+# operators on a Single Node OpenShift (SNO) cluster provisioned from the
+# RHDP "Red Hat OpenShift AI 3" catalog item (RHOAI pre-installed, GPU node
+# provisioned).
 #
-# Execution order is optimized for Web Terminal reliability:
-#   Steps 1-5  — Core configuration (safe, no network disruption)
-#   Step 5b    — Accelerator recording rules (GPU Operator prerequisite only)
-#   Step 6     — Operator install (may briefly disrupt Web Terminal)
-#   Step 7     — Post-operator setup (DSCI monitoring, UIPlugins, CRs)
-#   Step 8     — Dashboard restart (picks up everything)
-#   Step 9     — Verification (best effort)
+# Ported from rhoai-field-source-setup-guide, where it was developed and
+# tested. Operator installs and CR creation are skipped when already present.
 #
-# Steps 1-5b complete before any network disruption caused by RHCL/Service
-# Mesh installation. If the terminal disconnects during Step 6, operators
-# continue installing via OLM in the background. Re-run the script to
-# pick up where it left off — all steps are idempotent.
+# Target: RHOAI 3.5.2 on OpenShift 4.22+
 #
-# Usage:
-#   bash sno-enable-all-features.sh                 # Full run (recommended)
-#   bash sno-enable-all-features.sh --skip-install   # Skip operator install
+# --------------------------------------------------------------------------
+# Key design decisions
+# --------------------------------------------------------------------------
 #
-# Tip: In Web Terminal, run with nohup to survive disconnections:
-#   nohup bash sno-enable-all-features.sh > /tmp/sno.log 2>&1 &
-#   # Reconnect later:  tail -f /tmp/sno.log
+# 1. Operators first, then configure.
+#    The previous SNO script patched DSC early and installed operators late.
+#    This caused the DSCI monitoring to get permanently stuck when COO was
+#    not yet ready (the DSCI controller does not self-heal on missing
+#    dependencies, unlike the DSC controller which retries per-component).
+#    This script installs all operators first, confirms they are Succeeded,
+#    then patches DSCI and DSC. This eliminates the stuck-DSCI bug entirely.
 #
-# Prerequisites:
-#   - oc login completed
-#   - RHOAI 3.5.x Operator installed
+# 2. RHCL isolated last (network disruption).
+#    RHCL triggers Service Mesh 3 installation, which can briefly disrupt
+#    the OpenShift ingress layer. All configuration (DSCI, DSC, MLflow,
+#    MaaS Gateway, dashboard flags, accelerator rules) is committed before
+#    RHCL is installed, so the cluster state is saved even if the terminal
+#    disconnects. RHCL is the only operator in a separate phase.
+#
+# 3. Full DSCI/DSC merge patch.
+#    Instead of incremental patching (detect deltas), the script applies a
+#    full merge patch of the reference DSCI and DSC specs. This is safe
+#    because oc patch --type=merge is additive (does not remove fields not
+#    in the patch) and the RHOAI operator reconciles declaratively.
+#
+# 4. NFD + GPU Operator included.
+#    Both are installed early (non-disruptive) with their required CRs
+#    (NodeFeatureDiscovery, ClusterPolicy). If the base environment already
+#    has them (Succeeded CSV / existing ClusterPolicy), installs are skipped.
+#
+# 5. No Kueue, no Trainer.
+#    Kueue is no longer installed by this script (the previous SNO version
+#    installed it and created ResourceFlavors/ClusterQueue/LocalQueue). The
+#    reference DSC has kueue set to Removed. Existing Kueue objects on a
+#    cluster set up by the old script are left in place (not deleted). Trainer (Kubeflow Trainer v2) is also Removed: it needs
+#    the JobSet operator, which this script does not install, and leaving it
+#    Managed keeps the DSC Not Ready (PreConditionFailed). The dashboard
+#    "trainingJobs" flag is set to false to match (Step 8).
+#
+# 6. Existing OperatorGroups are respected.
+#    Some base environments pre-install operators (e.g. cert-manager with its
+#    own cert-manager-operator-og). The install_operator function detects
+#    existing OperatorGroups and skips creation to avoid the OLM
+#    TooManyOperatorGroups failure. The Subscription is still applied
+#    (idempotent) to ensure the desired channel is set.
+#
+# 7. Kuadrant operator sized for workshops (Step 9).
+#    RHCL's default 300Mi memory limit OOMKills the Kuadrant operator once
+#    ~30 users create MaaS subscriptions. Step 9 sets 1Gi/4Gi memory and
+#    200m/1 CPU through the RHCL OLM Subscription, right after the CSV
+#    succeeds and before the Kuadrant CR exists. Patched only when values
+#    differ, so re-runs do not restart the operator. Override with
+#    KUADRANT_{CPU,MEM}_{REQUEST,LIMIT} environment variables.
+#
+# 8. DCGM exporter ServiceMonitor (Step 3b).
+#    ClusterPolicy sets dcgmExporter.serviceMonitor.enabled so cluster
+#    Prometheus scrapes GPU metrics. Existing ClusterPolicies are patched.
+#
+# 9. Web Terminal operator (end of Step 3a, idempotent, non-blocking).
+#    Skipped if the web-terminal CSV is Succeeded or a Subscription exists.
+#    Otherwise subscribes in openshift-operators (redhat-operators, catalog
+#    default channel). Web Terminal shares the DevWorkspace Operator with
+#    DevSpaces: no DWO Subscription is created, DevSpaces is never touched,
+#    and the install is deferred if DWO is mid-install or in another
+#    namespace. Never aborts the script; status is reported in Step 11.
+#
+# --------------------------------------------------------------------------
+# Execution order
+# --------------------------------------------------------------------------
+#
+#   Step  | What                                          | Risk
+#   ------|-----------------------------------------------|------------------
+#    1    | Prerequisites check                           | None
+#    2    | User Workload Monitoring                      | None
+#    3a   | Install 8 non-disruptive operators            | None
+#         | (NFD, GPU, cert-manager, LWS, OTel,          |
+#         |  Tempo, COO, DevSpaces)                      |
+#         | + Web Terminal (skipped if present)           |
+#    3b   | Wait for operators + post-install CRs         | None
+#         | (NodeFeatureDiscovery, ClusterPolicy,         |
+#         |  LWS CR, UIPlugins, CheCluster)              |
+#    4    | DSCI merge patch (monitoring config)          | None (COO ready)
+#    5    | DSC merge patch (full component activation)   | None (cert-mgr ready)
+#    6    | MLflow server + demo project + EvalHub        | None
+#         | (+ shared tenant NetworkPolicy, MLflow probe) |
+#    7    | MaaS Gateway CRs                              | None
+#    8    | Dashboard menu + accelerator rules            | None
+#    9    | Install RHCL + Kuadrant + Authorino TLS       | NETWORK DISRUPTION
+#   10    | Dashboard restart                             | None
+#   11    | Verification (flags NOT READY items)          | None
+#
+#   Post-install CRs in Step 3b are "create and fire" -- the operator
+#   controller reconciles them in the background while Steps 4-8 run.
+#   This works because the operator is already installed (CRDs exist,
+#   controller is watching). No dependency is missing at creation time.
+#   Verification at Step 11 checks final status and flags anything
+#   that has not reached Ready.
+#
+# All steps are idempotent. Safe to re-run at any time.
+# If the terminal disconnects during Step 9, operators continue installing
+# via OLM in the background. Re-run the script to pick up where it left off.
+#
+# --------------------------------------------------------------------------
+# Usage
+# --------------------------------------------------------------------------
+#
+#   bash sno-enable-all-features-35.sh
+#   bash sno-enable-all-features-35.sh --skip-install
+#
+#   # In Web Terminal, run with nohup to survive disconnections:
+#   nohup bash sno-enable-all-features-35.sh > /tmp/sno.log 2>&1 &
+#   tail -f /tmp/sno.log
+#
+# --------------------------------------------------------------------------
+# Prerequisites
+# --------------------------------------------------------------------------
+#
+#   - oc login completed with cluster-admin
+#   - RHOAI 3.5.2 Operator installed (rhods-operator CSV Succeeded)
 #   - DataScienceCluster 'default-dsc' exists
+#   - RHDP "Red Hat OpenShift AI 3" SNO environment
+#
+# Created: 29 Sep 2026
+# Last modified: 26 Nov 2026
 ###############################################################################
 set -euo pipefail
 
 SKIP_INSTALL=false
 [[ "${1:-}" == "--skip-install" || "${1:-}" == "--skip" ]] && SKIP_INSTALL=true
 
+SCRIPT_START=$(date +%s)
+
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
-info()    { echo -e "${CYAN}[INFO]${NC} $*"; }
+elapsed() { local now; now=$(date +%s); local e=$((now - SCRIPT_START)); printf '%dm%02ds' $((e/60)) $((e%60)); }
+info()    { echo -e "${CYAN}[INFO]${NC} ($(elapsed)) $*"; }
 success() { echo -e "${GREEN}[OK]${NC}   $*"; }
 warn()    { echo -e "${YELLOW}[WARN]${NC} $*"; }
 error()   { echo -e "${RED}[ERR]${NC}  $*"; }
 
-# Operator definitions (used in Steps 6 and 7)
-# Kueue, cert-manager, LWS are installed first (no network disruption).
-# RHCL is installed last (triggers Service Mesh → may disrupt Web Terminal).
-declare -a OP_NAMES=( "Kueue"              "cert-manager"                    "LWS (LeaderWorkerSet)"       "OpenTelemetry"                    "Tempo"                    "COO (Cluster Observability)"                      "RHCL (Red Hat Connectivity Link)" )
-declare -a OP_NS=(    "openshift-operators" "cert-manager-operator"           "openshift-lws-operator"      "openshift-opentelemetry-operator" "openshift-tempo-operator" "openshift-cluster-observability-operator"          "redhat-connectivity-link-operator" )
-declare -a OP_GREP=(  "kueue"              "cert-manager"                    "leader-worker-set"           "opentelemetry"                    "tempo"                    "cluster-observability-operator"                    "rhcl-operator" )
-declare -a OP_SUB=(   "kueue-operator"     "openshift-cert-manager-operator" "leader-worker-set"           "opentelemetry-product"            "tempo-product"            "cluster-observability-operator"                    "rhcl-operator" )
-declare -a OP_CH=(    "stable-v1.3"        "stable-v1"                       "stable-v1.0"                 "stable"                           "stable"                   "stable"                                            "auto" )
-declare -a OP_MODE=(  "skip"               "own"                             "own"                         "all"                              "all"                      "all"                                               "all" )
-declare -a OP_USE=(   "Workbenches / DW"   "KServe / Model Serving"          "llm-d distributed inference" "Metrics & trace collection"       "Distributed trace store"  "Observe & Monitor dashboard (Perses)"              "MaaS / AIGateway" )
+###############################################################################
+# Helper: wait_for -- run a check command in a loop with a progress bar
+#
+# Usage:
+#   wait_for <timeout_sec> <label> <check_command>
+#
+# The check_command is eval'd each iteration. Returns 0 when the check
+# passes, or 1 if the timeout is reached.
+###############################################################################
+wait_for() {
+    local timeout="$1"
+    local label="$2"
+    shift 2
+    local check_cmd="$*"
+
+    local elapsed=0
+    local interval=5
+    local spin_chars='|/-\'
+    local spin_idx=0
+    local bar_width=30
+
+    while [ $elapsed -lt "$timeout" ]; do
+        if bash -c "$check_cmd" &>/dev/null; then
+            printf '\r%-70s\r' " "
+            success "$label"
+            return 0
+        fi
+
+        local pct=$(( elapsed * 100 / timeout ))
+        local filled=$(( pct * bar_width / 100 ))
+        local empty=$(( bar_width - filled ))
+        local spin_char="${spin_chars:$spin_idx:1}"
+        spin_idx=$(( (spin_idx + 1) % 4 ))
+
+        local bar=""
+        for (( _b=0; _b<filled; _b++ )); do bar+="="; done
+        if [ $filled -lt $bar_width ]; then bar+=">"; fi
+        for (( _b=0; _b<empty-1; _b++ )); do bar+=" "; done
+
+        printf '\r  %s [%-*s] %3d%% (%ds/%ds) %s' \
+            "$spin_char" "$bar_width" "$bar" "$pct" "$elapsed" "$timeout" "$label"
+
+        sleep "$interval"
+        elapsed=$((elapsed + interval))
+    done
+
+    printf '\r%-70s\r' " "
+    warn "$label -- timeout after ${timeout}s"
+    return 1
+}
+
+# Operator definitions (used in Step 3a)
+# Source column: most use redhat-operators; GPU uses certified-operators.
+# RHCL is NOT in this array -- installed separately in Step 9.
+declare -a OP_NAMES=( "NFD"                "NVIDIA GPU Operator"             "cert-manager"                    "LWS (LeaderWorkerSet)"       "OpenTelemetry"                    "Tempo"                    "COO (Cluster Observability)"                      "DevSpaces" )
+declare -a OP_NS=(    "openshift-nfd"      "nvidia-gpu-operator"             "cert-manager-operator"           "openshift-lws-operator"      "openshift-opentelemetry-operator" "openshift-tempo-operator" "openshift-cluster-observability-operator"          "openshift-operators" )
+declare -a OP_GREP=(  "nfd"               "gpu-operator"                     "cert-manager"                    "leader-worker-set"           "opentelemetry"                    "tempo"                    "cluster-observability-operator"                    "devspacesoperator" )
+declare -a OP_SUB=(   "nfd"               "gpu-operator-certified"           "openshift-cert-manager-operator" "leader-worker-set"           "opentelemetry-product"            "tempo-product"            "cluster-observability-operator"                    "devspaces" )
+declare -a OP_SRC=(   "redhat-operators"  "certified-operators"              "redhat-operators"                "redhat-operators"            "redhat-operators"                 "redhat-operators"         "redhat-operators"                                  "redhat-operators" )
+declare -a OP_CH=(    "auto"              "auto"                             "stable-v1"                       "stable-v1.0"                 "stable"                           "stable"                   "stable"                                            "stable" )
+declare -a OP_MODE=(  "own"               "own"                              "own"                             "own"                         "all"                              "all"                      "all"                                               "skip" )
+declare -a OP_USE=(   "GPU label detection" "GPU drivers + runtime"          "KServe / Model Serving"          "llm-d distributed inference" "Metrics & trace collection"       "Distributed trace store"  "Observe & Monitor dashboard (Perses)"              "Cloud IDE (CheCluster)" )
 
 echo "=============================================="
-echo " RHOAI 3.5 SNO — Enable All Features"
+echo " RHOAI 3.5.2 SNO -- Enable All Features"
 echo "=============================================="
 echo ""
-info "Order: Config (1-5c) → Operators (6) → Post-op (7) → Restart (8) → Verify (9)"
-info "Steps 1-5b complete before any network disruption."
+echo -e "${BOLD}  Step  | What                                       | Risk${NC}"
+echo -e "${BOLD}  ------|--------------------------------------------|-----------------${NC}"
+echo "   1    | Prerequisites check                        | None"
+echo "   2    | User Workload Monitoring                   | None"
+echo "   3a   | Install 8 non-disruptive operators         | None"
+echo "        | + Web Terminal (skipped if present)        | None"
+echo "   3b   | Wait + post-install CRs                    | None"
+echo "   4    | DSCI merge patch (monitoring config)       | None (COO ready)"
+echo "   5    | DSC merge patch (all components)           | None (cert-mgr)"
+echo "   6    | MLflow + demo project + EvalHub            | None"
+echo "   7    | MaaS Gateway CRs                           | None"
+echo "   8    | Dashboard menu + accelerator rules         | None"
+echo -e "   9    | Install RHCL + Kuadrant + Authorino TLS   | ${RED}NETWORK DISRUPTION${NC}"
+echo "  10    | Dashboard restart                          | None"
+echo "  11    | Verification (flags NOT READY)             | None"
+echo ""
+info "Steps 1-8 complete before any network disruption (RHCL at Step 9)."
 echo ""
 
 ###############################################################################
@@ -69,18 +246,17 @@ install_operator() {
     local SUB_NAME="$3"
     local CHANNEL="${4:-stable}"
     local MODE="${5:-own}"       # skip | own | all
+    local SOURCE="${6:-redhat-operators}"
 
-    # Auto-detect channel from packagemanifest when set to "auto"
     if [ "$CHANNEL" = "auto" ]; then
         CHANNEL=$(oc get packagemanifest "$SUB_NAME" -o jsonpath='{.status.defaultChannel}' 2>/dev/null)
         [ -z "$CHANNEL" ] && CHANNEL="stable"
         info "Auto-detected channel: ${CHANNEL} for ${SUB_NAME}"
     fi
 
-    info "Installing ${DISPLAY_NAME} (ns=${NAMESPACE}, ch=${CHANNEL}, mode=${MODE})..."
+    info "Installing ${DISPLAY_NAME} (ns=${NAMESPACE}, ch=${CHANNEL}, src=${SOURCE}, mode=${MODE})..."
 
     if [ "$MODE" = "skip" ]; then
-        # openshift-operators: already has Namespace + OperatorGroup
         oc apply -f - <<EOF
 apiVersion: operators.coreos.com/v1alpha1
 kind: Subscription
@@ -91,17 +267,20 @@ spec:
   channel: ${CHANNEL}
   installPlanApproval: Automatic
   name: ${SUB_NAME}
-  source: redhat-operators
+  source: ${SOURCE}
   sourceNamespace: openshift-marketplace
 EOF
     elif [ "$MODE" = "all" ]; then
-        # AllNamespaces mode: OperatorGroup WITHOUT targetNamespaces (e.g. RHCL)
         oc apply -f - <<EOF
 apiVersion: v1
 kind: Namespace
 metadata:
   name: ${NAMESPACE}
----
+EOF
+        local EXISTING_OG
+        EXISTING_OG=$(oc get operatorgroup -n "${NAMESPACE}" --no-headers 2>/dev/null | wc -l | tr -d ' ')
+        if [ "$EXISTING_OG" -eq 0 ]; then
+            oc apply -f - <<EOF
 apiVersion: operators.coreos.com/v1
 kind: OperatorGroup
 metadata:
@@ -109,7 +288,11 @@ metadata:
   namespace: ${NAMESPACE}
 spec:
   upgradeStrategy: Default
----
+EOF
+        else
+            info "OperatorGroup already exists in ${NAMESPACE} -- skipping creation"
+        fi
+        oc apply -f - <<EOF
 apiVersion: operators.coreos.com/v1alpha1
 kind: Subscription
 metadata:
@@ -119,17 +302,20 @@ spec:
   channel: ${CHANNEL}
   installPlanApproval: Automatic
   name: ${SUB_NAME}
-  source: redhat-operators
+  source: ${SOURCE}
   sourceNamespace: openshift-marketplace
 EOF
     else
-        # OwnNamespace mode: OperatorGroup WITH targetNamespaces (e.g. LWS, cert-manager)
         oc apply -f - <<EOF
 apiVersion: v1
 kind: Namespace
 metadata:
   name: ${NAMESPACE}
----
+EOF
+        local EXISTING_OG
+        EXISTING_OG=$(oc get operatorgroup -n "${NAMESPACE}" --no-headers 2>/dev/null | wc -l | tr -d ' ')
+        if [ "$EXISTING_OG" -eq 0 ]; then
+            oc apply -f - <<EOF
 apiVersion: operators.coreos.com/v1
 kind: OperatorGroup
 metadata:
@@ -139,7 +325,11 @@ spec:
   targetNamespaces:
   - ${NAMESPACE}
   upgradeStrategy: Default
----
+EOF
+        else
+            info "OperatorGroup already exists in ${NAMESPACE} -- skipping creation"
+        fi
+        oc apply -f - <<EOF
 apiVersion: operators.coreos.com/v1alpha1
 kind: Subscription
 metadata:
@@ -149,7 +339,7 @@ spec:
   channel: ${CHANNEL}
   installPlanApproval: Automatic
   name: ${SUB_NAME}
-  source: redhat-operators
+  source: ${SOURCE}
   sourceNamespace: openshift-marketplace
 EOF
     fi
@@ -157,20 +347,127 @@ EOF
 
 ###############################################################################
 # Helper: check if an operator is installed
+# Runs in subprocess to avoid SIGPIPE under set -o pipefail.
 ###############################################################################
 check_operator_installed() {
     local idx="$1"
+    local ns="${OP_NS[$idx]}"
+    local pattern="${OP_GREP[$idx]}"
     if [ "${OP_SUB[$idx]}" = "rhcl-operator" ]; then
-        oc get subscription -A --no-headers 2>/dev/null | grep -q "rhcl-operator"
+        bash -c 'oc get subscription -A --no-headers 2>/dev/null | grep -q "rhcl-operator"'
     else
-        oc get csv -n "${OP_NS[$idx]}" --no-headers 2>/dev/null | grep -q "${OP_GREP[$idx]}.*Succeeded"
+        bash -c 'oc get csv -n "'"$ns"'" --no-headers 2>/dev/null | grep -q "'"$pattern"'.*Succeeded"'
     fi
 }
 
 ###############################################################################
-# Phase 1: Required prerequisites (abort if missing)
+# Helper: install Web Terminal operator (idempotent, non-blocking)
+#
+# Mirrors the working install on a reference cluster:
+#   Subscription web-terminal in openshift-operators (global-operators OG,
+#   AllNamespaces), source redhat-operators, channel = catalog default (fast),
+#   installPlanApproval Automatic, no startingCSV.
+#
+# DevSpaces safety: Web Terminal and DevSpaces both depend on the
+# DevWorkspace Operator (DWO). This helper never creates a DWO Subscription
+# and never touches the DevSpaces Subscription/CheCluster. Web Terminal is
+# installed in the same namespace as DevSpaces (openshift-operators) so OLM
+# reuses the single existing DWO instead of creating a second one. If DWO is
+# mid-install/upgrade or lives in another namespace, the install is deferred.
+#
+# Every exit path returns 0 with a warn/info message, so a problem here never
+# aborts the rest of the script. No wait -- status is reported in Step 11.
 ###############################################################################
-info "=== Prerequisites ==="
+install_web_terminal() {
+    local WT_NS="openshift-operators"
+    local WT_PKG="web-terminal"
+    local WT_SRC="redhat-operators"
+
+    # 1. Already installed (CSV Succeeded) -> nothing to do
+    if bash -c 'oc get csv -n "'"$WT_NS"'" --no-headers 2>/dev/null | grep -q "^web-terminal\..*Succeeded"'; then
+        success "Web Terminal -- already installed, skipping"
+        return 0
+    fi
+
+    # 2. Subscription already exists (installing, or created by someone else) -> leave it alone
+    local WT_SUB_NS
+    WT_SUB_NS=$(oc get subscriptions.operators.coreos.com -A --no-headers 2>/dev/null \
+        | awk -v p="$WT_PKG" '$3==p {print $1; exit}' || true)
+    if [ -n "$WT_SUB_NS" ]; then
+        info "Web Terminal -- Subscription already exists in ${WT_SUB_NS} (CSV not Succeeded yet), not modifying"
+        return 0
+    fi
+
+    if [ "$SKIP_INSTALL" = true ]; then
+        warn "Web Terminal -- not installed, skipping (--skip-install)"
+        return 0
+    fi
+
+    # 3. Package must be available in the catalog
+    local WT_CH
+    WT_CH=$(oc get packagemanifest -n openshift-marketplace -l catalog="$WT_SRC" \
+        -o jsonpath='{.items[?(@.metadata.name=="'"$WT_PKG"'")].status.defaultChannel}' 2>/dev/null || true)
+    if [ -z "$WT_CH" ]; then
+        warn "Web Terminal -- package not found in ${WT_SRC} catalog, skipping (install manually from OperatorHub)"
+        return 0
+    fi
+
+    # 4. openshift-operators must have its AllNamespaces OperatorGroup (never create one there)
+    local OG_COUNT
+    OG_COUNT=$(oc get operatorgroup -n "$WT_NS" --no-headers 2>/dev/null | wc -l | tr -d ' ')
+    if [ "$OG_COUNT" -ne 1 ]; then
+        warn "Web Terminal -- expected 1 OperatorGroup in ${WT_NS}, found ${OG_COUNT}; skipping"
+        return 0
+    fi
+
+    # 5. DevWorkspace Operator safety (shared with DevSpaces)
+    local DWO_SUB_NS
+    DWO_SUB_NS=$(oc get subscriptions.operators.coreos.com -A --no-headers 2>/dev/null \
+        | awk '$3=="devworkspace-operator" {print $1; exit}' || true)
+    if [ -n "$DWO_SUB_NS" ] && [ "$DWO_SUB_NS" != "$WT_NS" ]; then
+        warn "Web Terminal -- DevWorkspace Operator is subscribed in ${DWO_SUB_NS} (expected ${WT_NS}); skipping to avoid a duplicate DWO"
+        return 0
+    fi
+    local DWO_PHASE
+    DWO_PHASE=$(oc get csv -n "$WT_NS" --no-headers 2>/dev/null \
+        | awk '$1 ~ /^devworkspace-operator\./ {print $NF; exit}' || true)
+    if [ -n "$DWO_PHASE" ] && [ "$DWO_PHASE" != "Succeeded" ]; then
+        warn "Web Terminal -- DevWorkspace Operator is ${DWO_PHASE} (shared with DevSpaces); deferring. Re-run the script later."
+        return 0
+    fi
+    if [ -n "$DWO_PHASE" ]; then
+        info "DevWorkspace Operator already present (shared with DevSpaces) -- OLM will reuse it"
+    else
+        info "DevWorkspace Operator not present -- OLM will resolve it as a Web Terminal dependency"
+    fi
+
+    # 6. Create the Subscription (create and fire)
+    info "Installing Web Terminal (ns=${WT_NS}, ch=${WT_CH}, src=${WT_SRC}, mode=skip)..."
+    if oc apply -f - <<EOF
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: ${WT_PKG}
+  namespace: ${WT_NS}
+spec:
+  channel: ${WT_CH}
+  installPlanApproval: Automatic
+  name: ${WT_PKG}
+  source: ${WT_SRC}
+  sourceNamespace: openshift-marketplace
+EOF
+    then
+        success "Web Terminal Subscription created (installing in background, verified in Step 11)"
+    else
+        warn "Web Terminal -- Subscription apply failed; continuing (install manually from OperatorHub)"
+    fi
+    return 0
+}
+
+###############################################################################
+# Step 1: Prerequisites (abort if missing)
+###############################################################################
+info "=== Step 1/11: Prerequisites ==="
 
 if ! oc whoami &>/dev/null; then
     error "oc login required"
@@ -178,10 +475,10 @@ if ! oc whoami &>/dev/null; then
 fi
 success "Logged in: $(oc whoami) @ $(oc whoami --show-server)"
 
-RHOAI_CSV=$(oc get csv -n redhat-ods-operator --no-headers 2>/dev/null | grep rhods | awk '{print $1}')
+RHOAI_CSV=$(oc get csv -n redhat-ods-operator --no-headers 2>/dev/null | grep rhods | awk '{print $1}' || true)
 if [ -z "$RHOAI_CSV" ]; then
     error "RHOAI Operator not installed"
-    echo "  → Install 'Red Hat OpenShift AI' from OperatorHub first"
+    echo "  Install it first: from OperatorHub (Software Catalog)"
     exit 1
 fi
 success "RHOAI: $(echo "$RHOAI_CSV" | sed 's/rhods-operator\.//')"
@@ -191,22 +488,26 @@ if ! oc get datasciencecluster default-dsc &>/dev/null; then
     exit 1
 fi
 success "DSC: default-dsc"
+
+if ! oc get dscinitialization default-dsci &>/dev/null; then
+    error "DSCInitialization 'default-dsci' not found"
+    exit 1
+fi
+success "DSCI: default-dsci"
 echo ""
 
 ###############################################################################
-# Step 1/9: User Workload Monitoring
-#   Prerequisite for Observe & Monitor.  DSCI monitoring (metrics/traces)
-#   is configured later in Step 7 after COO + Tempo are installed.
+# Step 2: User Workload Monitoring
 ###############################################################################
-info "=== Step 1/9: User Workload Monitoring ==="
+info "=== Step 2/11: User Workload Monitoring ==="
 
 if oc get configmap cluster-monitoring-config -n openshift-monitoring &>/dev/null 2>&1; then
     EXISTING=$(oc get configmap cluster-monitoring-config -n openshift-monitoring \
       -o jsonpath='{.data.config\.yaml}' 2>/dev/null)
     if echo "$EXISTING" | grep -q "enableUserWorkload: true"; then
-        success "User Workload Monitoring already enabled ✓"
+        success "User Workload Monitoring already enabled"
     else
-        warn "cluster-monitoring-config exists but enableUserWorkload not set — patching"
+        warn "cluster-monitoring-config exists but enableUserWorkload not set -- patching"
         oc apply -f - <<'EOF'
 apiVersion: v1
 kind: ConfigMap
@@ -233,112 +534,548 @@ EOF
     success "User Workload Monitoring enabled"
 fi
 
-# Brief wait for monitoring pods
-WAIT=0
-while [ "$(oc get pods -n openshift-user-workload-monitoring --no-headers 2>/dev/null | grep -c Running)" -lt 2 ]; do
-    [ $WAIT -ge 60 ] && { warn "Monitoring pods wait timeout (continuing)"; break; }
-    sleep 5; WAIT=$((WAIT + 5))
-done
+wait_for 60 "User Workload Monitoring pods" \
+    '[ "$(oc get pods -n openshift-user-workload-monitoring --no-headers 2>/dev/null | grep -c Running)" -ge 2 ]'
 echo ""
 
 ###############################################################################
-# Step 2/9: DSC component activation
+# Step 3a: Install 8 non-disruptive operators
 ###############################################################################
-info "=== Step 2/9: DSC component activation ==="
+info "=== Step 3a/11: Install non-disruptive operators ==="
 
+declare -a MISSING_NAMES=()
+declare -a MISSING_NS=()
+declare -a MISSING_GREP=()
+declare -a MISSING_IDX=()
+
+for i in "${!OP_NAMES[@]}"; do
+    if check_operator_installed "$i"; then
+        success "${OP_NAMES[$i]}"
+    else
+        warn "${OP_NAMES[$i]} -- not installed (needed for: ${OP_USE[$i]})"
+        MISSING_NAMES+=("${OP_NAMES[$i]}")
+        MISSING_NS+=("${OP_NS[$i]}")
+        MISSING_GREP+=("${OP_GREP[$i]}")
+        MISSING_IDX+=("$i")
+    fi
+done
+
+echo ""
+
+if [ ${#MISSING_NAMES[@]} -gt 0 ]; then
+    echo -e "${BOLD}+-----------------------------------------------------------+${NC}"
+    echo -e "${BOLD}|  ${#MISSING_NAMES[@]} operator(s) to install                               |${NC}"
+    echo -e "${BOLD}+-----------------------------------------------------------+${NC}"
+    for j in "${!MISSING_NAMES[@]}"; do
+        printf "${BOLD}|${NC}  %-3s %-30s  %s\n" "$((j+1))." "${MISSING_NAMES[$j]}" "${OP_USE[${MISSING_IDX[$j]}]}"
+    done
+    echo -e "${BOLD}+-----------------------------------------------------------+${NC}"
+
+    if [ "$SKIP_INSTALL" = true ]; then
+        warn "Skipping operator install (--skip-install)"
+        CONSOLE_URL=$(oc whoami --show-console 2>/dev/null || echo "")
+        [ -n "$CONSOLE_URL" ] && echo -e "  Install manually: ${CYAN}${CONSOLE_URL}/operatorhub${NC}"
+        echo ""
+    else
+        info "Auto-installing missing operators..."
+        echo ""
+        for j in "${!MISSING_IDX[@]}"; do
+            idx=${MISSING_IDX[$j]}
+            install_operator \
+                "${OP_NAMES[$idx]}" "${OP_NS[$idx]}" "${OP_SUB[$idx]}" \
+                "${OP_CH[$idx]}" "${OP_MODE[$idx]}" "${OP_SRC[$idx]}"
+        done
+        echo ""
+
+        # Per-operator wait with individual progress bars
+        info "Waiting for each operator to reach Succeeded..."
+        for j in "${!MISSING_NAMES[@]}"; do
+            wait_for 480 "${MISSING_NAMES[$j]}" \
+                'oc get csv -n "'"${MISSING_NS[$j]}"'" --no-headers 2>/dev/null | grep -q "'"${MISSING_GREP[$j]}"'.*Succeeded"'
+        done
+    fi
+else
+    success "All non-disruptive operators already installed"
+fi
+echo ""
+
+# Web Terminal -- after the loop so DevSpaces (and its DevWorkspace Operator)
+# has settled first. Non-blocking: never aborts the script, no wait.
+info "Web Terminal operator:"
+install_web_terminal || warn "Web Terminal -- unexpected error, continuing"
+echo ""
+
+###############################################################################
+# Step 3b: Post-install CRs (create and fire)
+###############################################################################
+info "=== Step 3b/11: Post-install CRs ==="
+
+# --- NodeFeatureDiscovery (requires NFD operator) ---
+if oc get crd nodefeaturediscoveries.nfd.openshift.io &>/dev/null 2>&1; then
+    if oc get nodefeaturediscovery nfd-instance -n openshift-nfd &>/dev/null 2>&1; then
+        success "NodeFeatureDiscovery CR already exists"
+    else
+        info "Creating NodeFeatureDiscovery CR..."
+        oc apply -f - <<'EOF'
+apiVersion: nfd.openshift.io/v1
+kind: NodeFeatureDiscovery
+metadata:
+  name: nfd-instance
+  namespace: openshift-nfd
+spec:
+  operand:
+    image: registry.redhat.io/openshift4/ose-node-feature-discovery-rhel9:latest
+    servicePort: 12000
+  workerConfig:
+    configData: |
+      core:
+        sleepInterval: 60s
+      sources:
+        pci:
+          deviceClassWhitelist:
+            - "0200"
+            - "03"
+            - "12"
+          deviceLabelFields:
+            - "vendor"
+EOF
+        success "NodeFeatureDiscovery CR created"
+    fi
+else
+    warn "NFD CRD not ready yet -- NodeFeatureDiscovery CR deferred"
+fi
+
+# --- ClusterPolicy (requires NVIDIA GPU Operator) ---
+if oc get crd clusterpolicies.nvidia.com &>/dev/null 2>&1; then
+    if oc get clusterpolicy gpu-cluster-policy &>/dev/null 2>&1; then
+        success "ClusterPolicy already exists"
+        # Existing clusters may predate the serviceMonitor setting below.
+        # Without it, cluster Prometheus never scrapes DCGM and the console
+        # GPU dashboards stay empty. Merge patch is idempotent.
+        oc patch clusterpolicy gpu-cluster-policy --type merge \
+            -p '{"spec":{"dcgmExporter":{"serviceMonitor":{"enabled":true}}}}' >/dev/null \
+            && success "ClusterPolicy dcgmExporter.serviceMonitor enabled" \
+            || warn "Could not enable dcgmExporter.serviceMonitor on ClusterPolicy"
+    else
+        info "Creating ClusterPolicy (GPU Operator CR)..."
+        oc apply -f - <<'EOF'
+apiVersion: nvidia.com/v1
+kind: ClusterPolicy
+metadata:
+  name: gpu-cluster-policy
+spec:
+  operator:
+    defaultRuntime: crio
+    use_ocp_driver_toolkit: true
+  daemonsets: {}
+  dcgm:
+    enabled: true
+  dcgmExporter:
+    enabled: true
+    config:
+      name: ""
+    # Creates the nvidia-dcgm-exporter ServiceMonitor so cluster Prometheus
+    # scrapes GPU metrics (OpenShift console GPU dashboards).
+    serviceMonitor:
+      enabled: true
+  devicePlugin:
+    config:
+      name: ""
+  driver:
+    enabled: true
+    certConfig:
+      name: ""
+    kernelModuleConfig:
+      name: ""
+    licensingConfig:
+      nlsEnabled: false
+      name: ""
+    repoConfig:
+      name: ""
+    upgradePolicy:
+      autoUpgrade: true
+      drain:
+        deleteEmptyDir: false
+        enable: false
+        force: false
+        timeoutSeconds: 300
+      maxParallelUpgrades: 1
+      maxUnavailable: 25%
+    virtualTopology:
+      config: ""
+  gfd:
+    enabled: true
+  migManager:
+    enabled: true
+  mps: {}
+  nodeStatusExporter:
+    enabled: true
+  sandboxDevicePlugin:
+    enabled: true
+  sandboxWorkloads:
+    enabled: false
+  toolkit:
+    enabled: true
+  validator:
+    plugin:
+      env:
+        - name: WITH_WORKLOAD
+          value: "false"
+  vfioManager:
+    enabled: true
+  vgpuDeviceManager:
+    enabled: true
+  vgpuManager:
+    enabled: false
+EOF
+        success "ClusterPolicy created"
+    fi
+else
+    warn "GPU Operator CRD not ready yet -- ClusterPolicy deferred"
+fi
+
+# --- LeaderWorkerSetOperator CR (requires LWS operator) ---
+if oc get crd leaderworkersetoperators.operator.openshift.io &>/dev/null 2>&1; then
+    if oc get leaderworkersetoperator cluster -n openshift-lws-operator &>/dev/null 2>&1; then
+        success "LeaderWorkerSetOperator CR already exists"
+    else
+        info "Creating LeaderWorkerSetOperator CR..."
+        oc apply -f - <<'EOF'
+apiVersion: operator.openshift.io/v1
+kind: LeaderWorkerSetOperator
+metadata:
+  name: cluster
+  namespace: openshift-lws-operator
+spec:
+  managementState: Managed
+  logLevel: Normal
+  operatorLogLevel: Normal
+EOF
+        success "LeaderWorkerSetOperator CR created"
+    fi
+else
+    warn "LWS CRD not ready yet -- LeaderWorkerSetOperator CR deferred"
+fi
+
+# --- UIPlugins (requires COO) ---
+if oc get crd uiplugins.observability.openshift.io &>/dev/null 2>&1; then
+    info "Configuring UIPlugins..."
+    oc apply -f - <<'EOF'
+apiVersion: observability.openshift.io/v1alpha1
+kind: UIPlugin
+metadata:
+  name: dashboards
+spec:
+  type: Dashboards
+---
+apiVersion: observability.openshift.io/v1alpha1
+kind: UIPlugin
+metadata:
+  name: monitoring
+spec:
+  type: Monitoring
+  monitoring:
+    perses:
+      enabled: true
+EOF
+    success "UIPlugins (dashboards + monitoring) configured"
+else
+    warn "COO CRD not ready yet -- UIPlugins deferred"
+fi
+
+# --- CheCluster (requires DevSpaces operator) ---
+DEVSPACES_NS="openshift-devspaces"
+if oc get crd checlusters.org.eclipse.che &>/dev/null 2>&1; then
+    if ! oc get namespace "$DEVSPACES_NS" &>/dev/null; then
+        info "Creating namespace $DEVSPACES_NS..."
+        oc create namespace "$DEVSPACES_NS"
+    fi
+    if oc get checluster devspaces -n "$DEVSPACES_NS" &>/dev/null; then
+        DS_PHASE=$(oc get checluster devspaces -n "$DEVSPACES_NS" \
+            -o jsonpath='{.status.chePhase}' 2>/dev/null || echo "Unknown")
+        success "CheCluster already exists (phase: $DS_PHASE)"
+    else
+        info "Creating CheCluster in $DEVSPACES_NS..."
+        oc apply -f - <<'CHEEOF'
+apiVersion: org.eclipse.che/v2
+kind: CheCluster
+metadata:
+  name: devspaces
+  namespace: openshift-devspaces
+spec:
+  components:
+    cheServer:
+      debug: false
+      logLevel: INFO
+    dashboard: {}
+    devWorkspace: {}
+    devfileRegistry: {}
+    imagePuller:
+      enable: false
+    metrics:
+      enable: true
+    pluginRegistry: {}
+  containerRegistry: {}
+  devEnvironments:
+    startTimeoutSeconds: 300
+    secondsOfRunBeforeIdling: -1
+    maxNumberOfWorkspacesPerUser: 5
+    maxNumberOfRunningWorkspacesPerUser: 1
+    containerBuildConfiguration:
+      openShiftSecurityContextConstraint: container-build
+    defaultEditor: che-incubator/che-code/latest
+    defaultComponents:
+    - name: dev-tools
+      container:
+        image: registry.redhat.io/devspaces/udi-rhel8:latest
+        memoryLimit: 4Gi
+        cpuLimit: "2"
+    defaultNamespace:
+      autoProvision: true
+      template: <username>-devspaces
+    security:
+      containerSecurityContext:
+        allowPrivilegeEscalation: true
+        runAsUser: 1234
+    storage:
+      pvcStrategy: per-user
+  gitServices: {}
+  networking: {}
+CHEEOF
+        success "CheCluster CR created (reconciling in background)"
+    fi
+else
+    warn "DevSpaces CRD not ready yet -- CheCluster deferred"
+fi
+echo ""
+
+###############################################################################
+# Step 4: DSCI merge patch
+#   COO + Tempo + OTel MUST be installed BEFORE this step. Otherwise DSCI
+#   sets Ready=Error and MonitoringStack/Perses are never provisioned.
+###############################################################################
+info "=== Step 4/11: DSCI merge patch ==="
+
+# Verify COO is ready before patching monitoring
+COO_OK=false
+if bash -c 'oc get csv -n openshift-cluster-observability-operator --no-headers 2>/dev/null | grep -q "cluster-observability-operator.*Succeeded"'; then
+    COO_OK=true
+    success "COO is Succeeded -- safe to patch DSCI monitoring"
+else
+    warn "COO not yet Succeeded -- waiting up to 3 min before patching DSCI..."
+    if wait_for 180 "COO Succeeded" \
+        'oc get csv -n openshift-cluster-observability-operator --no-headers 2>/dev/null | grep -q "cluster-observability-operator.*Succeeded"'; then
+        COO_OK=true
+    else
+        warn "COO still not ready -- patching DSCI anyway (monitoring may need re-trigger later)"
+    fi
+fi
+
+# Check current DSCI error state
+DSCI_READY=$(oc get dscinitialization default-dsci \
+    -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)
+DSCI_REASON=$(oc get dscinitialization default-dsci \
+    -o jsonpath='{.status.conditions[?(@.type=="Ready")].reason}' 2>/dev/null)
+
+NEED_RETRIGGER=false
+if [ "$DSCI_READY" = "False" ] && [ "$DSCI_REASON" = "Error" ]; then
+    warn "DSCI stuck in Error state -- will re-trigger reconciliation after patch"
+    NEED_RETRIGGER=true
+fi
+
+info "Applying full DSCI merge patch (monitoring: Managed, metrics, traces)..."
+oc patch dscinitialization default-dsci --type=merge -p '{
+  "spec": {
+    "applicationsNamespace": "redhat-ods-applications",
+    "monitoring": {
+      "managementState": "Managed",
+      "namespace": "redhat-ods-monitoring",
+      "alerting": {},
+      "metrics": {
+        "replicas": 1,
+        "storage": {
+          "size": "5Gi",
+          "retention": "90d"
+        }
+      },
+      "traces": {
+        "sampleRatio": "0.1",
+        "storage": {
+          "backend": "pv",
+          "retention": "2160h"
+        }
+      }
+    },
+    "trustedCABundle": {
+      "customCABundle": "",
+      "managementState": "Managed"
+    }
+  }
+}'
+success "DSCI patched"
+
+if [ "$NEED_RETRIGGER" = true ]; then
+    info "Re-triggering DSCI reconciliation..."
+    oc annotate dscinitialization default-dsci \
+        "opendatahub.io/retrigger=$(date +%s)" --overwrite 2>/dev/null || true
+fi
+
+# Wait for MonitoringStack + Perses
+if $COO_OK; then
+    wait_for 180 "MonitoringStack" \
+        'oc get dscinitialization default-dsci -o jsonpath="{.status.conditions[?(@.type==\"MonitoringStackAvailable\")].status}" 2>/dev/null | grep -q True'
+
+    # If DSCI still errored, restart RHOAI operator to re-trigger
+    MON_STATUS=$(oc get dscinitialization default-dsci \
+        -o jsonpath='{.status.conditions[?(@.type=="MonitoringStackAvailable")].status}' 2>/dev/null || true)
+    if [ "${MON_STATUS:-}" != "True" ]; then
+        DSCI_READY2=$(oc get dscinitialization default-dsci \
+            -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)
+        if [ "$DSCI_READY2" = "False" ]; then
+            warn "DSCI still not Ready -- restarting RHOAI operator..."
+            oc delete pod -n redhat-ods-operator -l name=rhods-operator --force --grace-period=0 2>/dev/null || true
+            wait_for 180 "MonitoringStack (after restart)" \
+                'oc get dscinitialization default-dsci -o jsonpath="{.status.conditions[?(@.type==\"MonitoringStackAvailable\")].status}" 2>/dev/null | grep -q True'
+        fi
+    fi
+
+    wait_for 120 "Perses" \
+        'oc get dscinitialization default-dsci -o jsonpath="{.status.conditions[?(@.type==\"PersesAvailable\")].status}" 2>/dev/null | grep -q True'
+fi
+echo ""
+
+###############################################################################
+# Step 5: DSC merge patch
+#   cert-manager must be Succeeded before this step (KServe depends on it).
+###############################################################################
+info "=== Step 5/11: DSC merge patch ==="
+
+CERTMGR_OK=false
+if bash -c 'oc get csv -n cert-manager-operator --no-headers 2>/dev/null | grep -q "cert-manager.*Succeeded"'; then
+    CERTMGR_OK=true
+else
+    warn "cert-manager not yet Succeeded -- waiting up to 2 min..."
+    if wait_for 120 "cert-manager Succeeded" \
+        'oc get csv -n cert-manager-operator --no-headers 2>/dev/null | grep -q "cert-manager.*Succeeded"'; then
+        CERTMGR_OK=true
+    fi
+fi
+
+info "Applying full DSC merge patch (all components)..."
 oc patch datasciencecluster default-dsc --type=merge -p '{
   "spec": {
     "components": {
-      "mlflowoperator": {
-        "managementState": "Managed"
-      },
-      "llamastackoperator": {
-        "managementState": "Removed"
-      },
-      "ogx": {
-        "managementState": "Managed"
-      },
       "aigateway": {
         "managementState": "Managed",
         "modelsAsAService": {
           "managementState": "Managed"
         }
+      },
+      "aipipelines": {
+        "managementState": "Managed"
+      },
+      "dashboard": {
+        "managementState": "Managed"
+      },
+      "feastoperator": {
+        "managementState": "Managed"
+      },
+      "kserve": {
+        "managementState": "Managed",
+        "modelsAsService": {
+          "managementState": "Removed"
+        },
+        "nim": {
+          "airGapped": false,
+          "managementState": "Managed"
+        },
+        "rawDeploymentServiceConfig": "Headless",
+        "wva": {
+          "managementState": "Removed"
+        }
+      },
+      "kueue": {
+        "autoCreateQueues": false,
+        "defaultClusterQueueName": "default",
+        "defaultLocalQueueName": "default",
+        "managementState": "Removed"
+      },
+      "llamastackoperator": {
+        "managementState": "Removed"
+      },
+      "mlflowoperator": {
+        "managementState": "Managed"
+      },
+      "modelregistry": {
+        "managementState": "Managed",
+        "registriesNamespace": "rhoai-model-registries"
+      },
+      "ogx": {
+        "managementState": "Managed"
+      },
+      "ray": {
+        "managementState": "Managed"
+      },
+      "trainer": {
+        "managementState": "Removed"
+      },
+      "trainingoperator": {
+        "managementState": "Managed"
+      },
+      "trustyai": {
+        "managementState": "Managed",
+        "mcpGuardrailsMode": false
+      },
+      "workbenches": {
+        "managementState": "Managed",
+        "workbenchNamespace": "rhods-notebooks"
       }
     }
   }
-}' 2>&1
+}'
+success "DSC patched (all components activated)"
 
-success "DSC patched"
-
-# Wait for OGX CRD
-info "Waiting for OGX provisioning..."
-WAIT=0
-while ! oc get crd ogxservers.ogx.io &>/dev/null 2>&1; do
-    [ $WAIT -ge 90 ] && { warn "OGX CRD wait timeout (continuing)"; break; }
-    sleep 5; WAIT=$((WAIT + 5))
-done
-oc get crd ogxservers.ogx.io &>/dev/null 2>&1 && success "OGX CRD registered ✓"
+wait_for 90 "OGX CRD" \
+    'oc get crd ogxservers.ogx.io &>/dev/null 2>&1' || true
 echo ""
 
 ###############################################################################
-# Step 3/8: MLflow server + demo project
-#   Creates the demo Data Science Project and a cluster-scoped MLflow CR.
-#   The MLflow operator (enabled in Step 2) creates HTTPRoute + tracking UI.
-#
-#   Idempotency scenarios handled:
-#   - PostgreSQL in CrashLoopBackOff → recovers with fresh PVC
-#   - mlflow-db-credentials secret missing → (re)created every run
-#   - MLflow CR exists but migration stuck → deletes stuck job for retry
-#   - MLflow CR exists and healthy → skips
-#   - No PostgreSQL at all → falls back to SQLite
-#
-#   Note: Uses the existing 'maas' database for MLflow (the maas user does
-#   not have CREATEDB privilege). MLflow creates its own tables within it.
+# Step 6: MLflow server + demo project + EvalHub
 ###############################################################################
-info "=== Step 3/9: MLflow server + demo project ==="
+info "=== Step 6/11: MLflow server + demo project + EvalHub ==="
 
 MLFLOW_NS="redhat-ods-applications"
 
-# Ensure demo namespace exists as a Data Science Project
+# Ensure demo namespace
 if oc get ns demo &>/dev/null 2>&1; then
-    success "Namespace 'demo' exists ✓"
+    success "Namespace 'demo' exists"
 else
     info "Creating namespace 'demo'..."
     oc create namespace demo 2>/dev/null || true
 fi
-# Label as Data Science Project (idempotent)
 oc label namespace demo opendatahub.io/dashboard=true --overwrite 2>/dev/null || true
 oc label namespace demo opendatahub.io/generated-namespace=true --overwrite 2>/dev/null || true
 success "demo labeled as Data Science Project"
 
-# Wait for MLflow CRD (registered after mlflowoperator becomes Managed)
-info "Waiting for MLflow CRD..."
-WAIT=0
-while ! oc get crd mlflows.mlflow.opendatahub.io &>/dev/null 2>&1; do
-    [ $WAIT -ge 120 ] && { warn "MLflow CRD not ready yet (continuing)"; break; }
-    sleep 5; WAIT=$((WAIT + 5))
-done
+# Wait for MLflow CRD
+wait_for 120 "MLflow CRD" \
+    'oc get crd mlflows.mlflow.opendatahub.io &>/dev/null 2>&1' || true
 
 if oc get crd mlflows.mlflow.opendatahub.io &>/dev/null 2>&1; then
-    success "MLflow CRD registered ✓"
+    success "MLflow CRD registered"
 
     MLFLOW_BACKEND="sqlite"
 
-    # --- PostgreSQL health check + mlflow-db-credentials secret ---
-    # This block runs every time (not just on first MLflow CR creation)
-    # to recover from missing secrets or PostgreSQL CrashLoopBackOff.
+    # PostgreSQL health check + mlflow-db-credentials secret
     if oc get deployment postgres -n "$MLFLOW_NS" &>/dev/null 2>&1; then
-
-        # Check if PostgreSQL pod is healthy
         PG_READY=$(oc get pods -n "$MLFLOW_NS" -l app=postgres \
             -o jsonpath='{.items[0].status.containerStatuses[0].ready}' 2>/dev/null || true)
 
         if [ "$PG_READY" != "true" ]; then
-            # Check for CrashLoopBackOff (common: set_passwords.sh race condition)
             PG_WAITING=$(oc get pods -n "$MLFLOW_NS" -l app=postgres \
                 -o jsonpath='{.items[0].status.containerStatuses[0].state.waiting.reason}' 2>/dev/null || true)
             if [ "$PG_WAITING" = "CrashLoopBackOff" ]; then
-                warn "PostgreSQL in CrashLoopBackOff — recovering with fresh PVC..."
+                warn "PostgreSQL in CrashLoopBackOff -- recovering..."
                 oc scale deployment postgres -n "$MLFLOW_NS" --replicas=0 2>/dev/null
                 sleep 3
                 oc delete pvc postgres-data -n "$MLFLOW_NS" 2>/dev/null || true
@@ -354,28 +1091,20 @@ spec:
 PGPVC
                 oc scale deployment postgres -n "$MLFLOW_NS" --replicas=1 2>/dev/null
             fi
-
-            info "Waiting for PostgreSQL to become ready (up to 60s)..."
-            WAIT=0
-            while [ $WAIT -lt 60 ]; do
-                PG_READY=$(oc get pods -n "$MLFLOW_NS" -l app=postgres \
-                    -o jsonpath='{.items[0].status.containerStatuses[0].ready}' 2>/dev/null || true)
-                [ "$PG_READY" = "true" ] && break
-                sleep 5; WAIT=$((WAIT + 5))
-            done
+            wait_for 60 "PostgreSQL ready" \
+                'oc get pods -n "'"$MLFLOW_NS"'" -l app=postgres -o jsonpath="{.items[0].status.containerStatuses[0].ready}" 2>/dev/null | grep -q true'
+            PG_READY=$(oc get pods -n "$MLFLOW_NS" -l app=postgres \
+                -o jsonpath='{.items[0].status.containerStatuses[0].ready}' 2>/dev/null || true)
         fi
 
         if [ "$PG_READY" = "true" ]; then
-            success "PostgreSQL running ✓"
+            success "PostgreSQL running"
             MLFLOW_BACKEND="postgres"
-
-            # Build DB URL using the 'maas' database (maas user cannot CREATE DATABASE)
             PG_FQDN="postgres.${MLFLOW_NS}.svc.cluster.local"
             PG_PASSWORD_ACTUAL=$(oc get deployment postgres -n "$MLFLOW_NS" \
                 -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="POSTGRESQL_PASSWORD")].value}' 2>/dev/null)
             PG_USER=$(oc get deployment postgres -n "$MLFLOW_NS" \
                 -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="POSTGRESQL_USER")].value}' 2>/dev/null)
-            # URL-encode password (pure bash — no python3 in Web Terminal)
             ENCODED_PW=""
             for (( _i=0; _i<${#PG_PASSWORD_ACTUAL}; _i++ )); do
                 _c="${PG_PASSWORD_ACTUAL:$_i:1}"
@@ -385,10 +1114,8 @@ PGPVC
                 esac
             done
             MLFLOW_DB_URL="postgresql://${PG_USER}:${ENCODED_PW}@${PG_FQDN}:5432/maas?sslmode=disable"
-
-            # Ensure mlflow-db-credentials secret exists (idempotent)
             if oc get secret mlflow-db-credentials -n "$MLFLOW_NS" &>/dev/null; then
-                success "mlflow-db-credentials secret ✓"
+                success "mlflow-db-credentials secret exists"
             else
                 oc create secret generic mlflow-db-credentials \
                     --from-literal=database-url="$MLFLOW_DB_URL" \
@@ -396,43 +1123,31 @@ PGPVC
                 success "mlflow-db-credentials secret created"
             fi
         else
-            warn "PostgreSQL not ready after 60s — falling back to SQLite for MLflow"
+            warn "PostgreSQL not ready -- falling back to SQLite"
         fi
     fi
 
-    # --- MLflow CR: create or recover ---
+    # MLflow CR: create or recover
     if oc get mlflow mlflow &>/dev/null 2>&1; then
         MLFLOW_AVAILABLE=$(oc get mlflow mlflow \
             -o jsonpath='{.status.conditions[?(@.type=="Available")].status}' 2>/dev/null || true)
-
         if [ "$MLFLOW_AVAILABLE" = "True" ]; then
-            success "MLflow server running ✓"
+            success "MLflow server running"
         else
-            # Detect stuck migration job (CreateContainerConfigError / Error)
             STUCK_POD=$(oc get pods -n "$MLFLOW_NS" --no-headers 2>/dev/null \
                 | grep -E "mlflow-mg.*(CreateContainerConfigError|Error|ImagePullBackOff)" \
                 | awk '{print $1}' | head -1)
             if [ -n "$STUCK_POD" ]; then
-                # Extract job name from pod name (strip trailing pod hash)
                 JOB_NAME=$(echo "$STUCK_POD" | rev | cut -d'-' -f2- | rev)
-                warn "Stuck migration job detected ($JOB_NAME) — deleting for retry..."
+                warn "Stuck migration job ($JOB_NAME) -- deleting..."
                 oc delete job "$JOB_NAME" -n "$MLFLOW_NS" 2>/dev/null || true
-                info "Waiting for MLflow to reconcile (up to 120s)..."
-                WAIT=0
-                while [ $WAIT -lt 120 ]; do
-                    MLFLOW_AVAILABLE=$(oc get mlflow mlflow \
-                        -o jsonpath='{.status.conditions[?(@.type=="Available")].status}' 2>/dev/null || true)
-                    [ "$MLFLOW_AVAILABLE" = "True" ] && break
-                    sleep 10; WAIT=$((WAIT + 10))
-                done
-                [ "$MLFLOW_AVAILABLE" = "True" ] && success "MLflow server recovered ✓" || \
-                    warn "MLflow not ready yet (will reconcile in background)"
+                wait_for 120 "MLflow recovery" \
+                    'oc get mlflow mlflow -o jsonpath="{.status.conditions[?(@.type==\"Available\")].status}" 2>/dev/null | grep -q True'
             else
-                warn "MLflow exists but not Available — will reconcile in background"
+                warn "MLflow exists but not Available -- will reconcile in background"
             fi
         fi
     else
-        # First-time MLflow CR creation
         if [ "$MLFLOW_BACKEND" = "postgres" ]; then
             oc apply -f - <<'EOF'
 apiVersion: mlflow.opendatahub.io/v1
@@ -451,7 +1166,7 @@ spec:
 EOF
             success "MLflow created (PostgreSQL backend)"
         else
-            info "No PostgreSQL available — using SQLite with PVC..."
+            info "No PostgreSQL available -- using SQLite with PVC..."
             oc apply -f - <<'EOF'
 apiVersion: mlflow.opendatahub.io/v1
 kind: MLflow
@@ -466,26 +1181,14 @@ spec:
 EOF
             success "MLflow created (SQLite backend)"
         fi
-
-        # Wait for MLflow to become available
-        info "Waiting for MLflow server..."
-        WAIT=0
-        while [ $WAIT -lt 120 ]; do
-            MLFLOW_READY=$(oc get mlflow mlflow \
-                -o jsonpath='{.status.conditions[?(@.type=="Available")].status}' 2>/dev/null || true)
-            [ "$MLFLOW_READY" = "True" ] && { success "MLflow server ready ✓"; break; }
-            sleep 10; WAIT=$((WAIT + 10))
-        done
-        [ "${MLFLOW_READY:-}" != "True" ] && warn "MLflow not ready yet (will reconcile in background)"
+        wait_for 120 "MLflow server" \
+            'oc get mlflow mlflow -o jsonpath="{.status.conditions[?(@.type==\"Available\")].status}" 2>/dev/null | grep -q True'
     fi
 else
-    warn "MLflow CRD not available — MLflow will be created on next run"
+    warn "MLflow CRD not available -- MLflow will be created on next run"
 fi
 
-# --- Step 3b: MLflow client ConfigMaps for demo apps ---
-# Pre-creates shared MLflow client configuration so that demo apps
-# (Open WebUI, Inference Planner, etc.) get tracing for free via
-# envFrom: configMapRef without knowing MLflow details.
+# MLflow client ConfigMaps
 info "Creating MLflow client ConfigMaps in demo..."
 oc apply -f - <<'MLCEOF'
 apiVersion: v1
@@ -522,10 +1225,8 @@ data:
         except ImportError:
             pass
 MLCEOF
-success "MLflow client ConfigMaps created (mlflow-client-env + mlflow-autolog-init)"
+success "MLflow client ConfigMaps created"
 
-# Create a non-expiring SA token secret for MLflow authentication
-# (kubernetes.io/service-account-token type tokens persist until the secret is deleted)
 if ! oc get secret mlflow-sa-token -n demo &>/dev/null 2>&1; then
     oc apply -n demo -f - <<'SATEOF'
 apiVersion: v1
@@ -539,24 +1240,21 @@ type: kubernetes.io/service-account-token
 SATEOF
     success "MLflow SA token secret created"
 else
-    success "MLflow SA token secret exists ✓"
+    success "MLflow SA token secret exists"
 fi
-echo ""
 
-# --- EvalHub (TrustyAI Operator CR) ---
-# EvalHub is deployed centrally in redhat-ods-applications.
-# RBAC grants are created per project namespace (demo).
+# --- EvalHub ---
 EVALHUB_NS="redhat-ods-applications"
-
+# TrustyAI registers the EvalHub CRD asynchronously after the DSC patch (Step 5).
+# Without this wait, a fresh cluster can skip EvalHub creation entirely.
+wait_for 180 "EvalHub CRD" \
+    'oc get crd evalhubs.trustyai.opendatahub.io &>/dev/null 2>&1' || true
 if oc get crd evalhubs.trustyai.opendatahub.io &>/dev/null 2>&1; then
-    success "EvalHub CRD registered ✓"
-
+    success "EvalHub CRD registered"
     if oc get evalhub evalhub -n "$EVALHUB_NS" &>/dev/null 2>&1; then
-        success "EvalHub already exists in $EVALHUB_NS ✓"
+        success "EvalHub already exists in $EVALHUB_NS"
     else
-        # SQLite is sufficient for demo SNO — no DB secrets or RBAC to PostgreSQL needed.
-        # PostgreSQL is deployed later by sno-setup-maas-35.sh, so it won't exist here anyway.
-        info "Creating EvalHub (SQLite backend — lightweight for demo)..."
+        info "Creating EvalHub (SQLite backend)..."
         oc apply -f - <<EOF
 apiVersion: trustyai.opendatahub.io/v1alpha1
 kind: EvalHub
@@ -576,27 +1274,17 @@ spec:
     - leaderboard-v2
     - safety-and-fairness-v1
 EOF
-        success "EvalHub created (SQLite backend)"
-
-        # Wait for EvalHub
-        info "Waiting for EvalHub..."
-        WAIT=0
-        while [ $WAIT -lt 120 ]; do
-            EVALHUB_PHASE=$(oc get evalhub evalhub -n "$EVALHUB_NS" \
-                -o jsonpath='{.status.phase}' 2>/dev/null || true)
-            [ "$EVALHUB_PHASE" = "Ready" ] && { success "EvalHub ready ✓"; break; }
-            sleep 10; WAIT=$((WAIT + 10))
-        done
-        [ "${EVALHUB_PHASE:-}" != "Ready" ] && warn "EvalHub not ready yet (will reconcile in background)"
+        success "EvalHub created"
+        wait_for 120 "EvalHub ready" \
+            'oc get evalhub evalhub -n "'"$EVALHUB_NS"'" -o jsonpath="{.status.phase}" 2>/dev/null | grep -q Ready'
     fi
 
-    # Ensure MLFLOW_TRACKING_URI is set in EvalHub CR spec.env
-    # (eval job pods inherit env from the CR; without this, MLflow logging fails server-side)
+    # MLFLOW_TRACKING_URI in EvalHub
     MLFLOW_URI="https://mlflow.${EVALHUB_NS}.svc:8443/mlflow"
     CURRENT_URI=$(oc get evalhub evalhub -n "$EVALHUB_NS" \
         -o jsonpath='{.spec.env[?(@.name=="MLFLOW_TRACKING_URI")].value}' 2>/dev/null || true)
     if [ "$CURRENT_URI" = "$MLFLOW_URI" ]; then
-        success "EvalHub MLFLOW_TRACKING_URI already set ✓"
+        success "EvalHub MLFLOW_TRACKING_URI already set"
     else
         info "Patching EvalHub with MLFLOW_TRACKING_URI..."
         oc patch evalhub evalhub -n "$EVALHUB_NS" --type=merge -p "
@@ -605,10 +1293,101 @@ spec:
   - name: MLFLOW_TRACKING_URI
     value: ${MLFLOW_URI}
 "
-        success "EvalHub MLFLOW_TRACKING_URI set to ${MLFLOW_URI}"
+        success "EvalHub MLFLOW_TRACKING_URI set"
     fi
 
-    # RBAC: grant EvalHub access to demo project
+    # Shared (cluster-level) tenant prerequisites. These are the parts of
+    # tenant setup that participants cannot apply from their own namespace.
+    # Kept identical to setup_evalhub_tenants() in the field-source repo's
+    # workshop-prep/setup_workbench_by_users.sh.
+    #
+    # The namespace-wide NetworkPolicy in EvalHub's namespace only admits traffic
+    # from OpenShift AI generated namespaces. Workshop projects created by script
+    # lack that label, so evaluation job sidecars cannot report status/results
+    # and jobs stay "pending". Admit any namespace on the kube-rbac-proxy port only.
+    info "Allowing tenant evaluation jobs to reach the EvalHub API..."
+    if oc apply -f - >/dev/null <<EOF
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: evalhub-allow-tenant-jobs
+  namespace: ${EVALHUB_NS}
+  labels:
+    app.kubernetes.io/part-of: evalhub-workshop
+  annotations:
+    description: Allow evaluation job sidecars in participant namespaces to report status and results to the EvalHub API.
+spec:
+  podSelector:
+    matchLabels:
+      app: eval-hub
+      component: api
+      instance: evalhub
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - namespaceSelector: {}
+    ports:
+    - protocol: TCP
+      port: 8443
+EOF
+    then
+        success "NetworkPolicy evalhub-allow-tenant-jobs applied in ${EVALHUB_NS}"
+    else
+        warn "Could not apply NetworkPolicy evalhub-allow-tenant-jobs in ${EVALHUB_NS}"
+    fi
+
+    # EvalHub caches its MLflow workspace probe at startup. If it started before
+    # MLflow was ready, tenant experiments fail until the API Pod is replaced.
+    # Non-fatal: every failure path warns and continues.
+    evalhub_refresh_mlflow_probe() {
+        local probe_re='"MLflow workspace support probed".*"workspaces_enabled"[[:space:]]*:[[:space:]]*'
+        local logs
+        if ! oc rollout status deployment/evalhub -n "$EVALHUB_NS" --timeout=180s >/dev/null 2>&1; then
+            warn "EvalHub deployment not rolled out -- skipping MLflow workspace probe check (re-run later)"
+            return 0
+        fi
+        if ! logs=$(oc logs deployment/evalhub -c evalhub -n "$EVALHUB_NS" --request-timeout=10s 2>/dev/null); then
+            warn "Could not read EvalHub logs -- skipping MLflow workspace probe check"
+            return 0
+        fi
+        # Here-strings, not pipes: under pipefail, grep -q exiting early can make
+        # the writer fail with SIGPIPE and turn a real match into "no match".
+        if grep -Eq "${probe_re}true" <<<"$logs"; then
+            success "EvalHub detected MLflow workspace support"
+            return 0
+        fi
+        if ! grep -Eq "${probe_re}false" <<<"$logs"; then
+            info "EvalHub MLflow workspace probe not found in logs -- leaving EvalHub running"
+            return 0
+        fi
+        warn "EvalHub started before MLflow workspace support was available"
+        if ! oc rollout status deployment/mlflow -n "$EVALHUB_NS" --timeout=120s >/dev/null 2>&1; then
+            warn "MLflow not rolled out -- re-run this script once MLflow is ready"
+            return 0
+        fi
+        if ! oc get --raw "/api/v1/namespaces/${EVALHUB_NS}/services/https:mlflow:8443/proxy/mlflow/api/3.0/mlflow/server-info" \
+            --request-timeout=10s 2>/dev/null | grep -E '"workspaces_enabled"[[:space:]]*:[[:space:]]*true' >/dev/null; then
+            warn "MLflow does not report workspace support yet -- re-run this script once MLflow is ready"
+            return 0
+        fi
+        warn "Restarting EvalHub API Pod to refresh its MLflow workspace probe (SQLite: custom providers must be re-registered)"
+        # The operator reverts Deployment restart annotations; replace the Pod directly.
+        if ! oc delete pod -n "$EVALHUB_NS" -l app=eval-hub,component=api,instance=evalhub --wait=true >/dev/null 2>&1 \
+            || ! oc rollout status deployment/evalhub -n "$EVALHUB_NS" --timeout=180s >/dev/null 2>&1; then
+            warn "EvalHub restart did not complete -- check: oc get pods -n ${EVALHUB_NS} -l app=eval-hub"
+            return 0
+        fi
+        if logs=$(oc logs deployment/evalhub -c evalhub -n "$EVALHUB_NS" --request-timeout=10s 2>/dev/null) \
+            && grep -Eq "${probe_re}true" <<<"$logs"; then
+            success "EvalHub now detects MLflow workspace support"
+        else
+            warn "EvalHub still does not report MLflow workspace support -- check the EvalHub startup logs"
+        fi
+    }
+    evalhub_refresh_mlflow_probe
+
+    # RBAC
     info "Configuring EvalHub RBAC for demo namespace..."
     oc apply -f - <<EOF
 apiVersion: rbac.authorization.k8s.io/v1
@@ -653,26 +1432,19 @@ subjects:
   name: evalhub-service
   namespace: ${EVALHUB_NS}
 EOF
-
-    # Create eval job ServiceAccount for demo namespace
     oc create sa "evalhub-${EVALHUB_NS}-job" -n demo 2>/dev/null || true
     oc adm policy add-role-to-user edit \
         "system:serviceaccount:demo:evalhub-${EVALHUB_NS}-job" -n demo 2>/dev/null || true
 
-    # Grant edit to the evalhub SA in demo (needed for adapter image builds:
-    # ImageStreams, BuildConfigs created during benchmark adapter builds)
     if ! oc get rolebinding -n demo -o jsonpath='{.items[*].subjects[*].name}' 2>/dev/null \
-        | tr ' ' '\n' | grep -qx "evalhub"; then
+        | tr ' ' '\n' | grep -x "evalhub"; then
         oc adm policy add-role-to-user edit \
             "system:serviceaccount:demo:evalhub" -n demo 2>/dev/null || true
         success "evalhub SA granted edit in demo"
     else
-        success "evalhub SA already has edit in demo ✓"
+        success "evalhub SA already has edit in demo"
     fi
 
-    # Grant evalhub-service SA secret CRUD in demo (the sidecar running as
-    # evalhub-service from redhat-ods-applications needs to read/create secrets
-    # like model-api-key in the target namespace)
     if ! oc get role evalhub-secret-access -n demo &>/dev/null 2>&1; then
         oc apply -f - <<EOF
 apiVersion: rbac.authorization.k8s.io/v1
@@ -701,11 +1473,9 @@ subjects:
 EOF
         success "evalhub-service SA granted secret access in demo"
     else
-        success "evalhub-service secret access already configured ✓"
+        success "evalhub-service secret access already configured"
     fi
 
-    # Copy evalhub-service-ca ConfigMap to demo namespace (eval job pods mount
-    # this volume for TLS trust back to the EvalHub API)
     if ! oc get configmap evalhub-service-ca -n demo &>/dev/null 2>&1; then
         if oc get configmap evalhub-service-ca -n "$EVALHUB_NS" &>/dev/null 2>&1; then
             CA_BUNDLE=$(oc get configmap evalhub-service-ca -n "$EVALHUB_NS" \
@@ -717,37 +1487,31 @@ EOF
             fi
             success "evalhub-service-ca ConfigMap copied to demo"
         else
-            warn "evalhub-service-ca ConfigMap not found in $EVALHUB_NS — eval jobs may fail to mount TLS volume"
+            warn "evalhub-service-ca not found in $EVALHUB_NS"
         fi
     else
-        success "evalhub-service-ca ConfigMap already in demo ✓"
+        success "evalhub-service-ca ConfigMap already in demo"
     fi
-
     success "EvalHub RBAC configured for demo namespace"
 else
-    warn "EvalHub CRD not available yet — EvalHub will be created on next run"
+    warn "EvalHub CRD not available yet -- EvalHub will be created on next run"
 fi
 echo ""
 
 ###############################################################################
-# Step 4/8: MaaS Gateway
-#   Creates GatewayClass + Gateway CRs. These are just API objects — they
-#   don't require RHCL to be running yet. The gateway controller will
-#   reconcile them once RHCL/Service Mesh is ready.
+# Step 7: MaaS Gateway CRs
 ###############################################################################
-info "=== Step 4/9: MaaS Gateway ==="
+info "=== Step 7/11: MaaS Gateway CRs ==="
 
 CLUSTER_DOMAIN=$(oc get ingresses.config/cluster -o jsonpath='{.spec.domain}')
-
 CERT_NAME=$(oc get secrets -n openshift-ingress --no-headers 2>/dev/null | \
   grep "cert-manager-ingress-cert\|router-certs-default" | awk '{print $1}' | head -1)
 if [ -z "$CERT_NAME" ]; then
-    warn "TLS cert not found — using cert-manager-ingress-cert"
+    warn "TLS cert not found -- using cert-manager-ingress-cert"
     CERT_NAME="cert-manager-ingress-cert"
 fi
 info "Domain: $CLUSTER_DOMAIN, TLS: $CERT_NAME"
 
-# GatewayClass (idempotent)
 oc apply -f - <<EOF
 apiVersion: gateway.networking.k8s.io/v1
 kind: GatewayClass
@@ -757,9 +1521,8 @@ spec:
   controllerName: openshift.io/gateway-controller/v1
 EOF
 
-# Gateway
 if oc get gateway maas-default-gateway -n openshift-ingress &>/dev/null 2>&1; then
-    success "maas-default-gateway already exists ✓"
+    success "maas-default-gateway already exists"
 else
     oc apply -f - <<EOF
 apiVersion: gateway.networking.k8s.io/v1
@@ -794,9 +1557,9 @@ fi
 echo ""
 
 ###############################################################################
-# Step 5/8: Dashboard menu activation
+# Step 8: Dashboard menu + accelerator rules
 ###############################################################################
-info "=== Step 5/9: Dashboard menu activation ==="
+info "=== Step 8/11: Dashboard menu + accelerator rules ==="
 
 WAIT=0
 while ! oc get odhdashboardconfig odh-dashboard-config -n redhat-ods-applications &>/dev/null; do
@@ -844,22 +1607,13 @@ oc patch odhdashboardconfig odh-dashboard-config \
       "projectRBAC": true,
       "promptManagement": true,
       "toolCalling": true,
-      "trainingJobs": true
+      "trainingJobs": false
     }
   }
 }'
-
 success "Dashboard menu patched"
-echo ""
 
-###############################################################################
-# Step 5b: Accelerator metrics recording rules
-#   GPU Operator is a prerequisite (already installed). This step creates
-#   PrometheusRules that convert DCGM_FI_* metrics into accelerator_*
-#   format expected by RHOAI Observe & Monitor dashboards.
-#   Without these, GPU utilization panels show "No data".
-#   Safe to run here — no dependency on Step 6 operators.
-###############################################################################
+# Accelerator metrics recording rules (cluster Prometheus)
 if oc get prometheusrule nvidia-gpu-operator-metrics -n nvidia-gpu-operator &>/dev/null 2>&1; then
     info "Configuring accelerator metrics recording rules..."
     oc apply -f - <<'EOF'
@@ -877,683 +1631,28 @@ spec:
     rules:
     - record: accelerator_gpu_utilization
       expr: |
-        label_replace(
-          DCGM_FI_DEV_GPU_UTIL,
-          "k8s_pod_name", "$1", "exported_pod", "(.*)"
-        )
+        label_replace(DCGM_FI_DEV_GPU_UTIL, "k8s_pod_name", "$1", "exported_pod", "(.*)")
     - record: accelerator_memory_used_bytes
       expr: |
-        label_replace(
-          DCGM_FI_DEV_FB_USED * 1024 * 1024,
-          "k8s_pod_name", "$1", "exported_pod", "(.*)"
-        )
+        label_replace(DCGM_FI_DEV_FB_USED * 1024 * 1024, "k8s_pod_name", "$1", "exported_pod", "(.*)")
     - record: accelerator_memory_total_bytes
       expr: |
-        label_replace(
-          (DCGM_FI_DEV_FB_USED + DCGM_FI_DEV_FB_FREE) * 1024 * 1024,
-          "k8s_pod_name", "$1", "exported_pod", "(.*)"
-        )
-    - record: accelerator_memory_clock_hertz
-      expr: |
-        label_replace(
-          DCGM_FI_DEV_MEM_CLOCK * 1e6,
-          "k8s_pod_name", "$1", "exported_pod", "(.*)"
-        )
-    - record: accelerator_sm_clock_hertz
-      expr: |
-        label_replace(
-          DCGM_FI_DEV_SM_CLOCK * 1e6,
-          "k8s_pod_name", "$1", "exported_pod", "(.*)"
-        )
+        label_replace((DCGM_FI_DEV_FB_USED + DCGM_FI_DEV_FB_FREE) * 1024 * 1024, "k8s_pod_name", "$1", "exported_pod", "(.*)")
     - record: accelerator_power_usage_watts
       expr: |
-        label_replace(
-          DCGM_FI_DEV_POWER_USAGE,
-          "k8s_pod_name", "$1", "exported_pod", "(.*)"
-        )
+        label_replace(DCGM_FI_DEV_POWER_USAGE, "k8s_pod_name", "$1", "exported_pod", "(.*)")
     - record: accelerator_temperature_celsius
       expr: |
-        label_replace(
-          DCGM_FI_DEV_GPU_TEMP,
-          "k8s_pod_name", "$1", "exported_pod", "(.*)"
-        )
+        label_replace(DCGM_FI_DEV_GPU_TEMP, "k8s_pod_name", "$1", "exported_pod", "(.*)")
 EOF
     success "Accelerator metrics recording rules created"
 else
-    info "GPU Operator not installed — accelerator recording rules skipped"
-fi
-echo ""
-
-###############################################################################
-# Step 5c: Red Hat OpenShift Dev Spaces
-#   Installs the DevSpaces operator in openshift-operators (same namespace as
-#   Web Terminal to share the DevWorkspace Operator dependency) and creates the
-#   CheCluster CR in openshift-devspaces.
-#   Placed here (before Step 6) because Step 6 operator installs may briefly
-#   disrupt ingress/Web Terminal. DevSpaces needs a stable cluster state.
-###############################################################################
-info "=== Step 5c: Red Hat OpenShift Dev Spaces ==="
-
-DEVSPACES_OPERATOR_NS="openshift-operators"
-DEVSPACES_NS="openshift-devspaces"
-DEVSPACES_WAIT=300
-
-# --- DevSpaces Operator ---
-if oc get csv -n "$DEVSPACES_OPERATOR_NS" 2>/dev/null | grep -q "devspacesoperator.*Succeeded"; then
-    DS_VER=$(oc get csv -n "$DEVSPACES_OPERATOR_NS" 2>/dev/null | grep "devspacesoperator" | awk '{print $1}')
-    success "DevSpaces operator already installed: $DS_VER"
-else
-    if ! oc get sub devspaces -n "$DEVSPACES_OPERATOR_NS" &>/dev/null; then
-        info "Creating DevSpaces subscription (channel: stable)..."
-        oc apply -f - <<DSEOF
-apiVersion: operators.coreos.com/v1alpha1
-kind: Subscription
-metadata:
-  name: devspaces
-  namespace: ${DEVSPACES_OPERATOR_NS}
-spec:
-  channel: stable
-  installPlanApproval: Automatic
-  name: devspaces
-  source: redhat-operators
-  sourceNamespace: openshift-marketplace
-DSEOF
-    fi
-    info "Waiting for DevSpaces CSV..."
-    DS_ELAPSED=0
-    while [ $DS_ELAPSED -lt $DEVSPACES_WAIT ]; do
-        if oc get csv -n "$DEVSPACES_OPERATOR_NS" 2>/dev/null | grep -q "devspacesoperator.*Succeeded"; then
-            success "DevSpaces operator is Succeeded."
-            break
-        fi
-        sleep 10
-        DS_ELAPSED=$((DS_ELAPSED + 10))
-    done
-    if [ $DS_ELAPSED -ge $DEVSPACES_WAIT ]; then
-        warn "DevSpaces CSV not yet Succeeded after ${DEVSPACES_WAIT}s -- it may still be installing."
-    fi
+    info "GPU Operator PrometheusRule not found -- accelerator rules skipped"
 fi
 
-# --- openshift-devspaces namespace ---
-if ! oc get namespace "$DEVSPACES_NS" &>/dev/null; then
-    info "Creating namespace $DEVSPACES_NS..."
-    oc create namespace "$DEVSPACES_NS"
-else
-    success "Namespace $DEVSPACES_NS already exists."
-fi
-
-# --- CheCluster CR ---
-if oc get checluster devspaces -n "$DEVSPACES_NS" &>/dev/null; then
-    DS_PHASE=$(oc get checluster devspaces -n "$DEVSPACES_NS" \
-        -o jsonpath='{.status.chePhase}' 2>/dev/null || echo "Unknown")
-    success "CheCluster already exists (phase: $DS_PHASE)."
-else
-    info "Creating CheCluster in $DEVSPACES_NS..."
-    oc apply -f - <<'CHEEOF'
-apiVersion: org.eclipse.che/v2
-kind: CheCluster
-metadata:
-  name: devspaces
-  namespace: openshift-devspaces
-spec:
-  components:
-    cheServer:
-      debug: false
-      logLevel: INFO
-    dashboard: {}
-    devWorkspace: {}
-    devfileRegistry: {}
-    imagePuller:
-      enable: false
-    metrics:
-      enable: true
-    pluginRegistry: {}
-  containerRegistry: {}
-  devEnvironments:
-    startTimeoutSeconds: 300
-    secondsOfRunBeforeIdling: -1
-    maxNumberOfWorkspacesPerUser: 5
-    maxNumberOfRunningWorkspacesPerUser: 1
-    containerBuildConfiguration:
-      openShiftSecurityContextConstraint: container-build
-    defaultEditor: che-incubator/che-code/latest
-    defaultComponents:
-    - name: dev-tools
-      container:
-        image: registry.redhat.io/devspaces/udi-rhel8:latest
-        memoryLimit: 4Gi
-        cpuLimit: "2"
-    defaultNamespace:
-      autoProvision: true
-      template: <username>-devspaces
-    security:
-      containerSecurityContext:
-        allowPrivilegeEscalation: true
-        runAsUser: 1234
-    storage:
-      pvcStrategy: per-user
-  gitServices: {}
-  networking: {}
-CHEEOF
-    success "CheCluster CR created."
-fi
-
-# --- Wait for CheCluster Active ---
-DS_PHASE=$(oc get checluster devspaces -n "$DEVSPACES_NS" \
-    -o jsonpath='{.status.chePhase}' 2>/dev/null || true)
-if [ "$DS_PHASE" = "Active" ]; then
-    DS_URL=$(oc get checluster devspaces -n "$DEVSPACES_NS" \
-        -o jsonpath='{.status.cheURL}' 2>/dev/null || true)
-    success "CheCluster is Active: $DS_URL"
-else
-    info "CheCluster phase: ${DS_PHASE:-pending}. Waiting up to ${DEVSPACES_WAIT}s..."
-    DS_ELAPSED=0
-    while [ $DS_ELAPSED -lt $DEVSPACES_WAIT ]; do
-        DS_PHASE=$(oc get checluster devspaces -n "$DEVSPACES_NS" \
-            -o jsonpath='{.status.chePhase}' 2>/dev/null || true)
-        if [ "$DS_PHASE" = "Active" ]; then
-            DS_URL=$(oc get checluster devspaces -n "$DEVSPACES_NS" \
-                -o jsonpath='{.status.cheURL}' 2>/dev/null || true)
-            success "CheCluster is Active: $DS_URL"
-            break
-        fi
-        sleep 10
-        DS_ELAPSED=$((DS_ELAPSED + 10))
-    done
-    if [ "$DS_PHASE" != "Active" ]; then
-        warn "CheCluster not Active yet -- server pods may still be starting."
-    fi
-fi
-echo ""
-
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-success "Core configuration complete (Steps 1-5c)."
-info "Next: operator install (Step 6) may briefly disrupt Web Terminal."
-info "If disconnected, re-run this script — completed steps are skipped."
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo ""
-
-###############################################################################
-# Step 6/9: Operator scan & install
-#   RHCL installation triggers Service Mesh 3, which may briefly disrupt
-#   the OpenShift ingress layer and Web Terminal connections.
-#   Even if the terminal disconnects, OLM continues the installation.
-###############################################################################
-info "=== Step 6/9: Operator scan & install ==="
-
-declare -a MISSING_NAMES=()
-declare -a MISSING_NS=()
-declare -a MISSING_GREP=()
-declare -a MISSING_IDX=()
-
-for i in "${!OP_NAMES[@]}"; do
-    if check_operator_installed "$i"; then
-        success "${OP_NAMES[$i]} ✓"
-    else
-        warn "${OP_NAMES[$i]} — not installed  (needed for: ${OP_USE[$i]})"
-        MISSING_NAMES+=("${OP_NAMES[$i]}")
-        MISSING_NS+=("${OP_NS[$i]}")
-        MISSING_GREP+=("${OP_GREP[$i]}")
-        MISSING_IDX+=("$i")
-    fi
-done
-
-echo ""
-
-if [ ${#MISSING_NAMES[@]} -gt 0 ]; then
-    echo -e "${BOLD}┌─────────────────────────────────────────────────────────┐${NC}"
-    echo -e "${BOLD}│  ${#MISSING_NAMES[@]} operator(s) not installed                          │${NC}"
-    echo -e "${BOLD}├─────────────────────────────────────────────────────────┤${NC}"
-    for j in "${!MISSING_NAMES[@]}"; do
-        printf "${BOLD}│${NC}  %-3s %-30s → %s\n" "$((j+1))." "${MISSING_NAMES[$j]}" "${OP_USE[${MISSING_IDX[$j]}]}"
-    done
-    echo -e "${BOLD}└─────────────────────────────────────────────────────────┘${NC}"
-
-    if [ "$SKIP_INSTALL" = true ]; then
-        warn "Skipping operator install (--skip-install)"
-        warn "Some features may not work without these operators"
-        echo -e "  Install manually: Console → Operators → OperatorHub"
-        CONSOLE_URL=$(oc whoami --show-console 2>/dev/null || echo "")
-        [ -n "$CONSOLE_URL" ] && echo -e "  ${CYAN}${CONSOLE_URL}/operatorhub${NC}"
-        echo ""
-    else
-        info "Auto-installing missing operators..."
-        info "RHCL triggers Service Mesh — Web Terminal may briefly disconnect."
-        echo ""
-        for j in "${!MISSING_IDX[@]}"; do
-            idx=${MISSING_IDX[$j]}
-            install_operator "${OP_NAMES[$idx]}" "${OP_NS[$idx]}" "${OP_SUB[$idx]}" "${OP_CH[$idx]}" "${OP_MODE[$idx]}"
-        done
-        echo ""
-
-        # Wait for operators (best effort — OLM handles it regardless)
-        info "Waiting for operators (up to 4min)..."
-        TIMEOUT=240; WAIT=0
-        while [ $WAIT -lt "$TIMEOUT" ]; do
-            ALL_READY=true
-            for i in "${!MISSING_NS[@]}"; do
-                if ! oc get csv -n "${MISSING_NS[$i]}" 2>/dev/null | grep -q "${MISSING_GREP[$i]}.*Succeeded"; then
-                    ALL_READY=false
-                fi
-            done
-            $ALL_READY && break
-            sleep 10; WAIT=$((WAIT + 10))
-        done
-        for i in "${!MISSING_NAMES[@]}"; do
-            if oc get csv -n "${MISSING_NS[$i]}" 2>/dev/null | grep -q "${MISSING_GREP[$i]}.*Succeeded"; then
-                success "${MISSING_NAMES[$i]} ✓"
-            else
-                warn "${MISSING_NAMES[$i]} — still installing (continues in background)"
-            fi
-        done
-    fi
-else
-    success "All additional operators installed ✓"
-fi
-
-# LWS operator CR (requires LWS operator)
-if oc get crd leaderworkersetoperators.operator.openshift.io &>/dev/null 2>&1; then
-    if ! oc get leaderworkersetoperator cluster -n openshift-lws-operator &>/dev/null 2>&1; then
-        info "Creating LeaderWorkerSet operator CR..."
-        oc apply -f - <<'EOF'
-apiVersion: operator.openshift.io/v1
-kind: LeaderWorkerSetOperator
-metadata:
-  name: cluster
-  namespace: openshift-lws-operator
-spec:
-  managementState: Managed
-  logLevel: Normal
-  operatorLogLevel: Normal
-EOF
-        success "LeaderWorkerSetOperator CR created"
-    else
-        success "LeaderWorkerSetOperator CR already exists ✓"
-    fi
-else
-    warn "LWS CRD not ready yet — LeaderWorkerSetOperator CR will be created on next run"
-fi
-
-# Kueue Resource Queues (requires Kueue operator)
-# Creates ResourceFlavors, ClusterQueue, and LocalQueue to enable hardware
-# profile selection and workload scheduling for workbenches / model serving.
-# Without these, the dashboard shows "No enabled or valid hardware profiles".
-if oc get crd clusterqueues.kueue.x-k8s.io &>/dev/null 2>&1; then
-    info "Configuring Kueue resource queues..."
-
-    # ResourceFlavor: default (CPU workloads — schedules on any untainted node)
-    if oc get resourceflavor default-flavor &>/dev/null 2>&1; then
-        success "ResourceFlavor default-flavor ✓"
-    else
-        oc apply -f - <<'EOF'
-apiVersion: kueue.x-k8s.io/v1beta1
-kind: ResourceFlavor
-metadata:
-  name: default-flavor
-spec: {}
-EOF
-        success "ResourceFlavor default-flavor created"
-    fi
-
-    # ResourceFlavor: gpu (GPU workloads — nodes with nvidia.com/gpu, tolerates taint)
-    if oc get resourceflavor gpu-flavor &>/dev/null 2>&1; then
-        success "ResourceFlavor gpu-flavor ✓"
-    else
-        oc apply -f - <<'EOF'
-apiVersion: kueue.x-k8s.io/v1beta1
-kind: ResourceFlavor
-metadata:
-  name: gpu-flavor
-spec:
-  nodeLabels:
-    nvidia.com/gpu.present: "true"
-  tolerations:
-    - key: nvidia.com/gpu
-      operator: Exists
-      effect: NoSchedule
-EOF
-        success "ResourceFlavor gpu-flavor created"
-    fi
-
-    # ClusterQueue: default (quotas for CPU + GPU workloads)
-    if oc get clusterqueue default &>/dev/null 2>&1; then
-        success "ClusterQueue default ✓"
-    else
-        oc apply -f - <<'EOF'
-apiVersion: kueue.x-k8s.io/v1beta1
-kind: ClusterQueue
-metadata:
-  name: default
-spec:
-  namespaceSelector: {}
-  resourceGroups:
-    - coveredResources: ["cpu", "memory"]
-      flavors:
-        - name: default-flavor
-          resources:
-            - name: cpu
-              nominalQuota: 32
-            - name: memory
-              nominalQuota: 128Gi
-    - coveredResources: ["nvidia.com/gpu"]
-      flavors:
-        - name: gpu-flavor
-          resources:
-            - name: nvidia.com/gpu
-              nominalQuota: 4
-EOF
-        success "ClusterQueue default created"
-    fi
-
-    # LocalQueue in demo namespace (namespace created in Step 3)
-    # The default-queue annotation makes it auto-selected for new workloads.
-    if oc get ns demo &>/dev/null 2>&1; then
-        if oc get localqueue default -n demo &>/dev/null 2>&1; then
-            success "LocalQueue default in demo ✓"
-        else
-            oc apply -f - <<'EOF'
-apiVersion: kueue.x-k8s.io/v1beta1
-kind: LocalQueue
-metadata:
-  name: default
-  namespace: demo
-  annotations:
-    kueue.x-k8s.io/default-queue: "true"
-spec:
-  clusterQueue: default
-EOF
-            success "LocalQueue default created in demo"
-        fi
-    else
-        warn "demo namespace not found — create it first, then re-run to add LocalQueue"
-    fi
-else
-    warn "Kueue CRDs not ready yet — resource queues will be configured on next run"
-fi
-
-# UIPlugins (requires COO)
-if oc get crd uiplugins.observability.openshift.io &>/dev/null 2>&1; then
-    info "Configuring UIPlugins..."
-    oc apply -f - <<'EOF'
-apiVersion: observability.openshift.io/v1alpha1
-kind: UIPlugin
-metadata:
-  name: dashboards
-spec:
-  type: Dashboards
----
-apiVersion: observability.openshift.io/v1alpha1
-kind: UIPlugin
-metadata:
-  name: monitoring
-spec:
-  type: Monitoring
-  monitoring:
-    perses:
-      enabled: true
-EOF
-    success "UIPlugins (dashboards + monitoring) configured"
-else
-    warn "COO not ready yet — UIPlugins will be configured on next run"
-fi
-
-# Kuadrant CR (requires RHCL operator)
-# The Kuadrant CR activates RHCL features: AuthPolicy, RateLimitPolicy,
-# TokenRateLimitPolicy, DNSPolicy, and TLSPolicy. Without it, RHCL is
-# installed but inactive — the Connectivity Link menu shows no resources.
-#
-# IMPORTANT: Kuadrant CR MUST be in kuadrant-system namespace.
-# The MaaS controller (odh-model-controller) hardcodes kuadrant-system
-# in the maas-default-gateway-authn-ssl EnvoyFilter. Placing Kuadrant
-# elsewhere causes the gateway auth cluster to target the wrong service.
-KUADRANT_NS="kuadrant-system"
-if oc get crd kuadrants.kuadrant.io &>/dev/null 2>&1; then
-    # Migrate from old location if needed
-    if oc get kuadrant kuadrant -n redhat-connectivity-link-operator &>/dev/null 2>&1; then
-        warn "Kuadrant CR in wrong namespace (redhat-connectivity-link-operator) — migrating to $KUADRANT_NS"
-        oc delete kuadrant kuadrant -n redhat-connectivity-link-operator --wait=false 2>/dev/null || true
-        sleep 5
-    fi
-
-    # Wait for RHCL sub-operators before creating Kuadrant CR
-    # Without this, Kuadrant gets stuck on MissingDependency (race condition)
-    if ! oc get kuadrant kuadrant -n "$KUADRANT_NS" &>/dev/null 2>&1; then
-        info "Waiting for RHCL sub-operators (Authorino, Limitador)..."
-        WAIT=0
-        while [ $WAIT -lt 120 ]; do
-            ALL_READY=true
-            for SUB_OP in authorino-operator limitador-operator; do
-                CSV_PHASE=$(oc get csv -n redhat-connectivity-link-operator --no-headers 2>/dev/null \
-                    | grep "$SUB_OP" | awk '{print $NF}')
-                [ "$CSV_PHASE" = "Succeeded" ] || { ALL_READY=false; break; }
-            done
-            [ "$ALL_READY" = true ] && break
-            sleep 10; WAIT=$((WAIT + 10))
-        done
-        [ "$ALL_READY" = true ] && success "Sub-operators ready ✓" || \
-            warn "Sub-operators not all ready — proceeding"
-    fi
-
-    if oc get kuadrant kuadrant -n "$KUADRANT_NS" &>/dev/null 2>&1; then
-        success "Kuadrant CR already exists in $KUADRANT_NS ✓"
-    else
-        info "Creating Kuadrant CR in $KUADRANT_NS..."
-        oc create namespace "$KUADRANT_NS" 2>/dev/null || true
-        oc apply -f - <<EOF
-apiVersion: kuadrant.io/v1beta1
-kind: Kuadrant
-metadata:
-  name: kuadrant
-  namespace: ${KUADRANT_NS}
-spec: {}
-EOF
-    fi
-
-    # Wait for Kuadrant Ready; full recovery if stuck on MissingDependency
-    # NOTE: Kuadrant operator checks dependencies at startup and caches result.
-    # OLM reverts rollout restart, so recovery = delete CR → kill pod → recreate CR.
-    info "Waiting for Kuadrant to become Ready..."
-    WAIT=0
-    while [ $WAIT -lt 90 ]; do
-        KREADY=$(oc get kuadrant kuadrant -n "$KUADRANT_NS" \
-            -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)
-        [ "$KREADY" = "True" ] && break
-        if [ $WAIT -eq 30 ] && [ "$KREADY" != "True" ]; then
-            KREASON=$(oc get kuadrant kuadrant -n "$KUADRANT_NS" \
-                -o jsonpath='{.status.conditions[?(@.type=="Ready")].reason}' 2>/dev/null || true)
-            if [ "$KREASON" = "MissingDependency" ]; then
-                warn "MissingDependency — full recovery (delete CR → kill pod → recreate)..."
-                oc delete kuadrant kuadrant -n "$KUADRANT_NS" --timeout=30s 2>/dev/null || true
-                sleep 5
-                KPOD=$(oc get pod -n redhat-connectivity-link-operator --no-headers 2>/dev/null \
-                    | grep kuadrant-operator-controller-manager | awk '{print $1}')
-                [ -n "$KPOD" ] && oc delete pod "$KPOD" -n redhat-connectivity-link-operator 2>/dev/null || true
-                sleep 20
-                oc apply -f - <<EOFRECOVERY
-apiVersion: kuadrant.io/v1beta1
-kind: Kuadrant
-metadata:
-  name: kuadrant
-  namespace: ${KUADRANT_NS}
-spec: {}
-EOFRECOVERY
-            fi
-        fi
-        sleep 5; WAIT=$((WAIT + 5))
-    done
-    [ "$KREADY" = "True" ] && success "Kuadrant CR Ready in $KUADRANT_NS ✓" || \
-        warn "Kuadrant not Ready yet — MaaS setup script will handle it"
-
-    # Configure Authorino TLS in kuadrant-system (required for MaaS gateway auth)
-    AUTHORINO_TLS=$(oc get authorino authorino -n "$KUADRANT_NS" \
-        -o jsonpath='{.spec.listener.tls.enabled}' 2>/dev/null || true)
-    if [ "$AUTHORINO_TLS" = "true" ]; then
-        success "Authorino TLS already enabled in $KUADRANT_NS ✓"
-    elif oc get authorino authorino -n "$KUADRANT_NS" &>/dev/null 2>&1; then
-        info "Configuring Authorino TLS in $KUADRANT_NS..."
-        oc annotate service authorino-authorino-authorization \
-            -n "$KUADRANT_NS" \
-            service.beta.openshift.io/serving-cert-secret-name=authorino-server-cert \
-            --overwrite 2>/dev/null || true
-        WAIT=0
-        while [ $WAIT -lt 30 ]; do
-            oc get secret authorino-server-cert -n "$KUADRANT_NS" &>/dev/null 2>&1 && break
-            sleep 3; WAIT=$((WAIT + 3))
-        done
-        oc patch authorino authorino -n "$KUADRANT_NS" --type=merge -p '{
-          "spec": { "listener": { "tls": { "enabled": true, "certSecretRef": { "name": "authorino-server-cert" } } } }
-        }' 2>/dev/null || true
-        oc -n "$KUADRANT_NS" set env deployment/authorino \
-            SSL_CERT_FILE=/etc/ssl/certs/openshift-service-ca/service-ca-bundle.crt \
-            REQUESTS_CA_BUNDLE=/etc/ssl/certs/openshift-service-ca/service-ca-bundle.crt 2>/dev/null || true
-        success "Authorino TLS configured in $KUADRANT_NS"
-    fi
-else
-    warn "Kuadrant CRD not ready yet — Kuadrant CR will be created on next run"
-fi
-
-# RHCL Console Plugin (requires RHCL operator)
-# The kuadrant-console-plugin provides RHCL / Kuadrant UI for managing
-# API policies, rate limiting, and gateway configuration in the console.
-if oc get consoleplugin kuadrant-console-plugin &>/dev/null 2>&1; then
-    # ConsolePlugin CR exists — check if the backing pod is running
-    if oc get pods -n redhat-connectivity-link-operator --no-headers 2>/dev/null \
-        | grep -q "kuadrant-console-plugin.*Running"; then
-
-        # Check if already enabled in console operator
-        ENABLED_PLUGINS=$(oc get console.operator.openshift.io cluster \
-            -o jsonpath='{.spec.plugins}' 2>/dev/null || echo "[]")
-        if echo "$ENABLED_PLUGINS" | grep -q "kuadrant-console-plugin"; then
-            success "RHCL console plugin already enabled ✓"
-        else
-            info "Enabling RHCL console plugin..."
-            if oc patch console.operator.openshift.io cluster --type=json \
-                -p '[{"op":"add","path":"/spec/plugins/-","value":"kuadrant-console-plugin"}]' 2>/dev/null; then
-                success "RHCL console plugin enabled"
-            else
-                warn "Could not enable RHCL console plugin — enable manually via Console → Operators → Installed Operators → RHCL"
-            fi
-        fi
-    else
-        warn "kuadrant-console-plugin pod not running yet — plugin will be enabled on next run"
-    fi
-else
-    warn "RHCL console plugin CR not found — RHCL operator may still be installing"
-fi
-echo ""
-
-###############################################################################
-# Step 7/9: DSCI Observability + Post-operator setup
-#   COO + Tempo must be installed BEFORE configuring DSCI metrics/traces.
-#   Otherwise DSCI reconciler sets Ready=Error and MonitoringStack/Perses
-#   are never created.  This step (re-)triggers DSCI reconciliation.
-###############################################################################
-info "=== Step 7/9: DSCI Observability + Post-operator setup ==="
-
-# Check whether COO and Tempo are available
-COO_OK=false; TEMPO_OK=false
-oc get csv -n openshift-cluster-observability-operator --no-headers 2>/dev/null \
-    | grep -q "cluster-observability-operator.*Succeeded" && COO_OK=true
-oc get csv -n openshift-tempo-operator --no-headers 2>/dev/null \
-    | grep -q "tempo.*Succeeded" && TEMPO_OK=true
-
-if $COO_OK; then
-    success "COO installed ✓"
-else
-    warn "COO not installed — Observe & Monitor will not work"
-fi
-if $TEMPO_OK; then
-    success "Tempo installed ✓"
-else
-    warn "Tempo not installed — traces will not work"
-fi
-
-if $COO_OK; then
-    # --- DSCI monitoring: metrics + traces ---
-    # This MUST run after COO is installed. If run before, DSCI sets
-    # Ready=Error("ClusterObservability operator must be installed")
-    # and MonitoringStack/Perses are never provisioned.
-    info "Configuring DSCI observability (metrics + traces)..."
-
-    # Check current DSCI error state
-    DSCI_READY=$(oc get dscinitialization default-dsci \
-        -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)
-    DSCI_REASON=$(oc get dscinitialization default-dsci \
-        -o jsonpath='{.status.conditions[?(@.type=="Ready")].reason}' 2>/dev/null)
-
-    NEED_RETRIGGER=false
-    if [ "$DSCI_READY" = "False" ] && [ "$DSCI_REASON" = "Error" ]; then
-        warn "DSCI stuck in Error state — will re-trigger reconciliation"
-        NEED_RETRIGGER=true
-    fi
-
-    METRICS_CONFIGURED=$(oc get dscinitialization default-dsci \
-        -o jsonpath='{.spec.monitoring.metrics.storage.size}' 2>/dev/null)
-    if [ -n "$METRICS_CONFIGURED" ] && [ "$NEED_RETRIGGER" = false ]; then
-        success "DSCI metrics already configured (storage: $METRICS_CONFIGURED) ✓"
-    else
-        # Apply or re-apply monitoring config
-        oc patch dscinitialization default-dsci --type=merge -p '{
-          "spec": {
-            "monitoring": {
-              "managementState": "Managed",
-              "namespace": "redhat-ods-monitoring",
-              "alerting": {},
-              "metrics": {
-                "replicas": 1,
-                "storage": {
-                  "size": "5Gi",
-                  "retention": "90d"
-                }
-              },
-              "traces": {
-                "sampleRatio": "0.1",
-                "storage": {
-                  "backend": "pv",
-                  "retention": "2160h"
-                }
-              }
-            }
-          }
-        }'
-        success "DSCI metrics/traces configured"
-
-        if [ "$NEED_RETRIGGER" = true ]; then
-            # Force DSCI re-reconciliation by toggling an annotation
-            info "Re-triggering DSCI reconciliation..."
-            oc annotate dscinitialization default-dsci \
-                "opendatahub.io/retrigger=$(date +%s)" --overwrite 2>/dev/null || true
-        fi
-    fi
-
-    # Wait for MonitoringStack
-    info "Waiting for MonitoringStack (up to 3 min)..."
-    MON_STATUS=""
-    WAIT=0
-    while [ $WAIT -lt 180 ]; do
-        MON_STATUS=$(oc get dscinitialization default-dsci \
-            -o jsonpath='{.status.conditions[?(@.type=="MonitoringStackAvailable")].status}' 2>/dev/null)
-        [ "$MON_STATUS" = "True" ] && { success "MonitoringStack ✓"; break; }
-        # Check if DSCI still errored (operator might need restart)
-        if [ $WAIT -eq 60 ]; then
-            DSCI_READY2=$(oc get dscinitialization default-dsci \
-                -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)
-            if [ "$DSCI_READY2" = "False" ]; then
-                warn "DSCI still not Ready after 60s — restarting RHOAI operator to re-trigger..."
-                oc delete pod -n redhat-ods-operator -l name=rhods-operator --force --grace-period=0 2>/dev/null || true
-            fi
-        fi
-        sleep 10; WAIT=$((WAIT + 10))
-    done
-    [ "${MON_STATUS:-}" != "True" ] && warn "MonitoringStack not ready yet (will reconcile in background)"
-
-    # DCGM metrics for RHOAI MonitoringStack Prometheus
-    # The RHOAI MonitoringStack Prometheus only scrapes its own namespace by
-    # default. Without this ServiceMonitor, the "LLM Utilization" tab in
-    # Observe & Monitor shows no GPU data (it uses data-science-prometheus-
-    # datasource, NOT the cluster Prometheus).
-    # The recording rule converts DCGM_FI_* → accelerator_* within this Prometheus.
-    if oc get prometheusrule nvidia-gpu-operator-metrics -n nvidia-gpu-operator &>/dev/null 2>&1; then
+# DCGM metrics for RHOAI MonitoringStack Prometheus
+if oc get prometheusrule nvidia-gpu-operator-metrics -n nvidia-gpu-operator &>/dev/null 2>&1; then
+    if oc get namespace redhat-ods-monitoring &>/dev/null 2>&1; then
         info "Configuring DCGM metrics for RHOAI MonitoringStack..."
         oc apply -f - <<'DCGMEOF'
 apiVersion: monitoring.coreos.com/v1
@@ -1589,106 +1688,300 @@ spec:
     rules:
     - record: accelerator_gpu_utilization
       expr: |
-        label_replace(
-          DCGM_FI_DEV_GPU_UTIL,
-          "k8s_pod_name", "$1", "exported_pod", "(.*)"
-        )
+        label_replace(DCGM_FI_DEV_GPU_UTIL, "k8s_pod_name", "$1", "exported_pod", "(.*)")
     - record: accelerator_memory_used_bytes
       expr: |
-        label_replace(
-          DCGM_FI_DEV_FB_USED * 1024 * 1024,
-          "k8s_pod_name", "$1", "exported_pod", "(.*)"
-        )
+        label_replace(DCGM_FI_DEV_FB_USED * 1024 * 1024, "k8s_pod_name", "$1", "exported_pod", "(.*)")
     - record: accelerator_memory_total_bytes
       expr: |
-        label_replace(
-          (DCGM_FI_DEV_FB_USED + DCGM_FI_DEV_FB_FREE) * 1024 * 1024,
-          "k8s_pod_name", "$1", "exported_pod", "(.*)"
-        )
-    - record: accelerator_memory_clock_hertz
-      expr: |
-        label_replace(
-          DCGM_FI_DEV_MEM_CLOCK * 1e6,
-          "k8s_pod_name", "$1", "exported_pod", "(.*)"
-        )
-    - record: accelerator_sm_clock_hertz
-      expr: |
-        label_replace(
-          DCGM_FI_DEV_SM_CLOCK * 1e6,
-          "k8s_pod_name", "$1", "exported_pod", "(.*)"
-        )
+        label_replace((DCGM_FI_DEV_FB_USED + DCGM_FI_DEV_FB_FREE) * 1024 * 1024, "k8s_pod_name", "$1", "exported_pod", "(.*)")
     - record: accelerator_power_usage_watts
       expr: |
-        label_replace(
-          DCGM_FI_DEV_POWER_USAGE,
-          "k8s_pod_name", "$1", "exported_pod", "(.*)"
-        )
+        label_replace(DCGM_FI_DEV_POWER_USAGE, "k8s_pod_name", "$1", "exported_pod", "(.*)")
     - record: accelerator_temperature_celsius
       expr: |
-        label_replace(
-          DCGM_FI_DEV_GPU_TEMP,
-          "k8s_pod_name", "$1", "exported_pod", "(.*)"
-        )
+        label_replace(DCGM_FI_DEV_GPU_TEMP, "k8s_pod_name", "$1", "exported_pod", "(.*)")
 DCGMEOF
-        success "DCGM ServiceMonitor + recording rules created in redhat-ods-monitoring"
-    else
-        info "GPU Operator not installed — DCGM metrics for RHOAI monitoring skipped"
+        success "DCGM ServiceMonitor + recording rules in redhat-ods-monitoring"
     fi
-
-    # Wait for Perses
-    info "Waiting for Perses..."
-    PERSES_STATUS=""
-    WAIT=0
-    while [ $WAIT -lt 120 ]; do
-        PERSES_STATUS=$(oc get dscinitialization default-dsci \
-            -o jsonpath='{.status.conditions[?(@.type=="PersesAvailable")].status}' 2>/dev/null)
-        [ "$PERSES_STATUS" = "True" ] && { success "Perses ✓"; break; }
-        sleep 10; WAIT=$((WAIT + 10))
-    done
-    [ "${PERSES_STATUS:-}" != "True" ] && warn "Perses not ready yet (will reconcile in background)"
 fi
+echo ""
 
+echo "================================================================"
+success "Steps 1-8 complete ($(elapsed)). All configuration committed."
+warn "Step 9 (RHCL) may briefly disrupt ingress/Web Terminal."
+warn "If disconnected, re-run this script -- completed steps are skipped."
+echo "================================================================"
 echo ""
 
 ###############################################################################
-# Step 8/9: Dashboard restart
-#   Restart AFTER all config + operators + post-operator resources are in
-#   place. This ensures the dashboard picks up UIPlugins, Perses, and all
-#   dashboard feature flags in a single restart.
+# Step 9: Install RHCL + Kuadrant + Authorino TLS
 ###############################################################################
-info "=== Step 8/9: Dashboard restart ==="
+info "=== Step 9/11: RHCL + Kuadrant + Authorino TLS ==="
+
+RHCL_NS="redhat-connectivity-link-operator"
+KUADRANT_NS="kuadrant-system"
+
+# RHCL Operator
+if bash -c 'oc get subscription -A --no-headers 2>/dev/null | grep -q "rhcl-operator"'; then
+    success "RHCL operator subscription exists"
+else
+    if [ "$SKIP_INSTALL" = true ]; then
+        warn "Skipping RHCL install (--skip-install)"
+    else
+        info "Installing RHCL operator (this triggers Service Mesh 3)..."
+        install_operator "RHCL (Connectivity Link)" "$RHCL_NS" "rhcl-operator" "stable" "all" "redhat-operators"
+    fi
+fi
+
+if [ "$SKIP_INSTALL" != true ]; then
+    wait_for 480 "RHCL operator Succeeded" \
+        'oc get csv -n "'"$RHCL_NS"'" --no-headers 2>/dev/null | grep -q "rhcl-operator.*Succeeded"'
+fi
+
+# Kuadrant operator resources (OOMKill fix)
+# RHCL 1.4.3 ships kuadrant-operator-controller-manager with a 300Mi memory
+# limit. With ~30 workshop users creating MaaS subscriptions, the operator
+# exceeds it, is OOMKilled in a loop, and new TokenRateLimitPolicies never
+# get a status (MaaS subscriptions Degraded, auth policies Pending).
+# Observed usage: ~530Mi at ~30 users x 1 model x 2 tiers.
+#
+# Set through the OLM Subscription (spec.config.resources); OLM reverts
+# direct Deployment edits. Idempotent: the Subscription is patched only when
+# its values differ from the targets below, so re-runs do not trigger an
+# operator restart. A changed value makes OLM roll the operator pod
+# (~3-5 min, policy reconciliation pauses), so the script waits for the
+# rollout before creating the Kuadrant CR. Override via environment, e.g.
+#   KUADRANT_MEM_LIMIT=8Gi bash sno-enable-all-features-35.sh
+KUADRANT_CPU_REQUEST="${KUADRANT_CPU_REQUEST:-200m}"
+KUADRANT_MEM_REQUEST="${KUADRANT_MEM_REQUEST:-1Gi}"
+KUADRANT_CPU_LIMIT="${KUADRANT_CPU_LIMIT:-1}"
+KUADRANT_MEM_LIMIT="${KUADRANT_MEM_LIMIT:-4Gi}"
+KUADRANT_DEPLOY="kuadrant-operator-controller-manager"
+
+RHCL_SUB_REF=$(oc get subscriptions.operators.coreos.com -A \
+    -o jsonpath='{range .items[?(@.spec.name=="rhcl-operator")]}{.metadata.namespace}{" "}{.metadata.name}{"\n"}{end}' \
+    2>/dev/null | head -1 || true)
+if [ -n "$RHCL_SUB_REF" ]; then
+    RHCL_SUB_NS="${RHCL_SUB_REF%% *}"
+    RHCL_SUB_NAME="${RHCL_SUB_REF##* }"
+    CUR_RES=$(oc get subscriptions.operators.coreos.com "$RHCL_SUB_NAME" -n "$RHCL_SUB_NS" \
+        -o jsonpath='{.spec.config.resources.requests.cpu}|{.spec.config.resources.requests.memory}|{.spec.config.resources.limits.cpu}|{.spec.config.resources.limits.memory}' \
+        2>/dev/null || true)
+    WANT_RES="${KUADRANT_CPU_REQUEST}|${KUADRANT_MEM_REQUEST}|${KUADRANT_CPU_LIMIT}|${KUADRANT_MEM_LIMIT}"
+
+    if [ "$CUR_RES" = "$WANT_RES" ]; then
+        success "Kuadrant operator resources already set (mem ${KUADRANT_MEM_REQUEST}/${KUADRANT_MEM_LIMIT}, cpu ${KUADRANT_CPU_REQUEST}/${KUADRANT_CPU_LIMIT})"
+    else
+        info "Setting Kuadrant operator resources via Subscription ${RHCL_SUB_NS}/${RHCL_SUB_NAME} (current: ${CUR_RES:-default})..."
+        if oc patch subscriptions.operators.coreos.com "$RHCL_SUB_NAME" -n "$RHCL_SUB_NS" --type=merge -p "{
+          \"spec\": { \"config\": { \"resources\": {
+            \"requests\": { \"cpu\": \"${KUADRANT_CPU_REQUEST}\", \"memory\": \"${KUADRANT_MEM_REQUEST}\" },
+            \"limits\":   { \"cpu\": \"${KUADRANT_CPU_LIMIT}\",   \"memory\": \"${KUADRANT_MEM_LIMIT}\" }
+          } } }
+        }" >/dev/null 2>&1; then
+            success "Kuadrant operator Subscription patched (mem ${KUADRANT_MEM_REQUEST}/${KUADRANT_MEM_LIMIT}, cpu ${KUADRANT_CPU_REQUEST}/${KUADRANT_CPU_LIMIT})"
+            wait_for 360 "Kuadrant operator rolled out with ${KUADRANT_MEM_LIMIT} memory limit" \
+                '[ "$(oc get deploy '"$KUADRANT_DEPLOY"' -n '"$RHCL_SUB_NS"' -o jsonpath="{.spec.template.spec.containers[0].resources.limits.memory}" 2>/dev/null)" = "'"$KUADRANT_MEM_LIMIT"'" ] && oc rollout status deploy/'"$KUADRANT_DEPLOY"' -n '"$RHCL_SUB_NS"' --timeout=5s' \
+                || warn "Kuadrant operator rollout not finished yet -- OLM applies it in the background; verify in Step 11"
+        else
+            warn "Could not patch Kuadrant operator resources on ${RHCL_SUB_NS}/${RHCL_SUB_NAME}"
+        fi
+    fi
+else
+    warn "RHCL Subscription not found -- Kuadrant operator resources not set (re-run after RHCL installs)"
+fi
+
+# Kuadrant CR
+if oc get crd kuadrants.kuadrant.io &>/dev/null 2>&1; then
+    if oc get kuadrant kuadrant -n "$RHCL_NS" &>/dev/null 2>&1; then
+        warn "Kuadrant CR in wrong namespace ($RHCL_NS) -- migrating to $KUADRANT_NS"
+        oc delete kuadrant kuadrant -n "$RHCL_NS" --wait=false 2>/dev/null || true
+        sleep 5
+    fi
+
+    if ! oc get kuadrant kuadrant -n "$KUADRANT_NS" &>/dev/null 2>&1; then
+        info "Waiting for RHCL sub-operators (Authorino, Limitador)..."
+        wait_for 120 "RHCL sub-operators" \
+            'oc get csv -n "'"$RHCL_NS"'" --no-headers 2>/dev/null | grep -q "authorino-operator.*Succeeded" && oc get csv -n "'"$RHCL_NS"'" --no-headers 2>/dev/null | grep -q "limitador-operator.*Succeeded"'
+    fi
+
+    if oc get kuadrant kuadrant -n "$KUADRANT_NS" &>/dev/null 2>&1; then
+        success "Kuadrant CR already exists in $KUADRANT_NS"
+    else
+        info "Creating Kuadrant CR in $KUADRANT_NS..."
+        oc create namespace "$KUADRANT_NS" 2>/dev/null || true
+        oc apply -f - <<EOF
+apiVersion: kuadrant.io/v1beta1
+kind: Kuadrant
+metadata:
+  name: kuadrant
+  namespace: ${KUADRANT_NS}
+spec: {}
+EOF
+    fi
+
+    # Wait with recovery for MissingDependency
+    info "Waiting for Kuadrant to become Ready..."
+    WAIT=0; KREADY=""
+    while [ $WAIT -lt 90 ]; do
+        KREADY=$(oc get kuadrant kuadrant -n "$KUADRANT_NS" \
+            -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)
+        [ "$KREADY" = "True" ] && break
+        if [ $WAIT -eq 30 ] && [ "$KREADY" != "True" ]; then
+            KREASON=$(oc get kuadrant kuadrant -n "$KUADRANT_NS" \
+                -o jsonpath='{.status.conditions[?(@.type=="Ready")].reason}' 2>/dev/null || true)
+            if [ "$KREASON" = "MissingDependency" ]; then
+                warn "MissingDependency -- full recovery (delete CR -> kill pod -> recreate)..."
+                oc delete kuadrant kuadrant -n "$KUADRANT_NS" --timeout=30s 2>/dev/null || true
+                sleep 5
+                KPOD=$(oc get pod -n "$RHCL_NS" --no-headers 2>/dev/null \
+                    | grep kuadrant-operator-controller-manager | awk '{print $1}')
+                [ -n "$KPOD" ] && oc delete pod "$KPOD" -n "$RHCL_NS" 2>/dev/null || true
+                sleep 20
+                oc apply -f - <<EOFRECOVERY
+apiVersion: kuadrant.io/v1beta1
+kind: Kuadrant
+metadata:
+  name: kuadrant
+  namespace: ${KUADRANT_NS}
+spec: {}
+EOFRECOVERY
+            fi
+        fi
+        sleep 5; WAIT=$((WAIT + 5))
+    done
+    [ "$KREADY" = "True" ] && success "Kuadrant CR Ready in $KUADRANT_NS" || \
+        warn "Kuadrant not Ready yet -- MaaS setup script will handle it"
+
+    # Authorino TLS
+    AUTHORINO_TLS=$(oc get authorino authorino -n "$KUADRANT_NS" \
+        -o jsonpath='{.spec.listener.tls.enabled}' 2>/dev/null || true)
+    if [ "$AUTHORINO_TLS" = "true" ]; then
+        success "Authorino TLS already enabled in $KUADRANT_NS"
+    elif oc get authorino authorino -n "$KUADRANT_NS" &>/dev/null 2>&1; then
+        info "Configuring Authorino TLS in $KUADRANT_NS..."
+        oc annotate service authorino-authorino-authorization \
+            -n "$KUADRANT_NS" \
+            service.beta.openshift.io/serving-cert-secret-name=authorino-server-cert \
+            --overwrite 2>/dev/null || true
+        wait_for 30 "Authorino server cert" \
+            'oc get secret authorino-server-cert -n "'"$KUADRANT_NS"'" &>/dev/null 2>&1'
+        oc patch authorino authorino -n "$KUADRANT_NS" --type=merge -p '{
+          "spec": { "listener": { "tls": { "enabled": true, "certSecretRef": { "name": "authorino-server-cert" } } } }
+        }' 2>/dev/null || true
+        oc -n "$KUADRANT_NS" set env deployment/authorino \
+            SSL_CERT_FILE=/etc/ssl/certs/openshift-service-ca/service-ca-bundle.crt \
+            REQUESTS_CA_BUNDLE=/etc/ssl/certs/openshift-service-ca/service-ca-bundle.crt 2>/dev/null || true
+        success "Authorino TLS configured in $KUADRANT_NS"
+    fi
+else
+    warn "Kuadrant CRD not ready yet -- will be created on next run"
+fi
+
+# RHCL Console Plugin
+if oc get consoleplugin kuadrant-console-plugin &>/dev/null 2>&1; then
+    if bash -c 'oc get pods -n "'"$RHCL_NS"'" --no-headers 2>/dev/null | grep -q "kuadrant-console-plugin.*Running"'; then
+        ENABLED_PLUGINS=$(oc get console.operator.openshift.io cluster \
+            -o jsonpath='{.spec.plugins}' 2>/dev/null || echo "[]")
+        if echo "$ENABLED_PLUGINS" | grep -q "kuadrant-console-plugin"; then
+            success "RHCL console plugin already enabled"
+        else
+            info "Enabling RHCL console plugin..."
+            if oc patch console.operator.openshift.io cluster --type=json \
+                -p '[{"op":"add","path":"/spec/plugins/-","value":"kuadrant-console-plugin"}]' 2>/dev/null; then
+                success "RHCL console plugin enabled"
+            else
+                warn "Could not enable RHCL console plugin"
+            fi
+        fi
+    else
+        warn "kuadrant-console-plugin pod not running yet"
+    fi
+else
+    warn "RHCL console plugin CR not found -- operator may still be installing"
+fi
+echo ""
+
+###############################################################################
+# Step 10: Dashboard restart
+###############################################################################
+info "=== Step 10/11: Dashboard restart ==="
 oc rollout restart deployment/rhods-dashboard -n redhat-ods-applications 2>/dev/null || true
 info "Restarting (1-2 min)..."
 sleep 10
 oc rollout status deployment/rhods-dashboard -n redhat-ods-applications --timeout=120s 2>/dev/null || \
-    warn "Rollout timeout — will complete shortly"
+    warn "Rollout timeout -- will complete shortly"
 success "Dashboard restarted"
 echo ""
 
 ###############################################################################
-# Step 9/9: Verification
+# Step 11: Verification
 ###############################################################################
-info "=== Step 9/9: Verification ==="
+info "=== Step 11/11: Verification ==="
+NOT_READY_COUNT=0
+NOT_READY_ITEMS=()
+
+# DSC components
 info "DSC components:"
-for comp in MLflowOperatorReady OGXReady AIGatewayReady KserveReady TrustyAIReady AIPipelinesReady DashboardReady WorkbenchesReady ModelsAsAServiceReady; do
+for comp in MLflowOperatorReady OGXReady AIGatewayReady KserveReady TrustyAIReady AIPipelinesReady DashboardReady WorkbenchesReady ModelsAsAServiceReady ModelRegistryReady FeastOperatorReady; do
     STATUS=$(oc get datasciencecluster default-dsc -o jsonpath="{.status.conditions[?(@.type==\"${comp}\")].status}" 2>/dev/null)
     REASON=$(oc get datasciencecluster default-dsc -o jsonpath="{.status.conditions[?(@.type==\"${comp}\")].reason}" 2>/dev/null)
     if [ "$STATUS" = "True" ]; then
-        echo "  ✅ ${comp}"
+        echo -e "  ${GREEN}[OK]${NC} ${comp}"
+    elif [ "$comp" = "ModelsAsAServiceReady" ]; then
+        echo -e "  ${YELLOW}[--]${NC} ${comp} (expected -- becomes Ready after MaaS setup: sno-setup-maas-35.sh)"
     else
-        echo "  ⬚  ${comp} (${REASON:-pending})"
+        echo -e "  ${RED}[!!]${NC} ${comp} (${REASON:-pending})"
+        NOT_READY_COUNT=$((NOT_READY_COUNT + 1))
+        NOT_READY_ITEMS+=("$comp")
     fi
 done
 
 echo ""
-info "Operators:"
+info "Operators (non-disruptive):"
 for i in "${!OP_NAMES[@]}"; do
     if check_operator_installed "$i"; then
-        echo "  ✅ ${OP_NAMES[$i]}"
+        echo -e "  ${GREEN}[OK]${NC} ${OP_NAMES[$i]}"
     else
-        echo "  ⬚  ${OP_NAMES[$i]}"
+        echo -e "  ${RED}[!!]${NC} ${OP_NAMES[$i]}"
+        NOT_READY_COUNT=$((NOT_READY_COUNT + 1))
+        NOT_READY_ITEMS+=("${OP_NAMES[$i]}")
     fi
 done
+# RHCL (separate check)
+if bash -c 'oc get csv -n redhat-connectivity-link-operator --no-headers 2>/dev/null | grep -q "rhcl-operator.*Succeeded"'; then
+    echo -e "  ${GREEN}[OK]${NC} RHCL (Connectivity Link)"
+else
+    if bash -c 'oc get subscription -A --no-headers 2>/dev/null | grep -q "rhcl-operator"'; then
+        echo -e "  ${YELLOW}[..]${NC} RHCL (installing)"
+    else
+        echo -e "  ${RED}[!!]${NC} RHCL (not installed)"
+    fi
+    NOT_READY_COUNT=$((NOT_READY_COUNT + 1))
+    NOT_READY_ITEMS+=("RHCL")
+fi
+# Web Terminal (separate check)
+if bash -c 'oc get csv -n openshift-operators --no-headers 2>/dev/null | grep -q "^web-terminal\..*Succeeded"'; then
+    echo -e "  ${GREEN}[OK]${NC} Web Terminal"
+else
+    if bash -c 'oc get subscriptions.operators.coreos.com -A --no-headers 2>/dev/null | awk '"'"'$3=="web-terminal"'"'"' | grep -q .'; then
+        echo -e "  ${YELLOW}[..]${NC} Web Terminal (installing)"
+    else
+        echo -e "  ${RED}[!!]${NC} Web Terminal (not installed)"
+    fi
+    NOT_READY_COUNT=$((NOT_READY_COUNT + 1))
+    NOT_READY_ITEMS+=("Web Terminal")
+fi
+KUADRANT_LIVE_LIMIT=$(oc get deploy kuadrant-operator-controller-manager -n redhat-connectivity-link-operator \
+    -o jsonpath='{.spec.template.spec.containers[0].resources.limits.memory}' 2>/dev/null || true)
+if [ -n "$KUADRANT_LIVE_LIMIT" ]; then
+    if [ "$KUADRANT_LIVE_LIMIT" = "${KUADRANT_MEM_LIMIT:-4Gi}" ]; then
+        echo -e "  ${GREEN}[OK]${NC} Kuadrant operator memory limit (${KUADRANT_LIVE_LIMIT})"
+    else
+        echo -e "  ${YELLOW}[..]${NC} Kuadrant operator memory limit (${KUADRANT_LIVE_LIMIT}, target ${KUADRANT_MEM_LIMIT:-4Gi}; OOMKill risk at default 300Mi)"
+    fi
+fi
 
 echo ""
 info "Observability:"
@@ -1696,21 +1989,74 @@ MON_STATUS=$(oc get dscinitialization default-dsci \
   -o jsonpath='{.status.conditions[?(@.type=="MonitoringStackAvailable")].status}' 2>/dev/null)
 PERSES_STATUS=$(oc get dscinitialization default-dsci \
   -o jsonpath='{.status.conditions[?(@.type=="PersesAvailable")].status}' 2>/dev/null)
-[ "${MON_STATUS:-}" = "True" ] && echo "  ✅ MonitoringStack" || echo "  ⬚  MonitoringStack"
-[ "${PERSES_STATUS:-}" = "True" ] && echo "  ✅ Perses" || echo "  ⬚  Perses"
+if [ "${MON_STATUS:-}" = "True" ]; then
+    echo -e "  ${GREEN}[OK]${NC} MonitoringStack"
+else
+    echo -e "  ${RED}[!!]${NC} MonitoringStack"
+    NOT_READY_COUNT=$((NOT_READY_COUNT + 1))
+    NOT_READY_ITEMS+=("MonitoringStack")
+fi
+if [ "${PERSES_STATUS:-}" = "True" ]; then
+    echo -e "  ${GREEN}[OK]${NC} Perses"
+else
+    echo -e "  ${RED}[!!]${NC} Perses"
+    NOT_READY_COUNT=$((NOT_READY_COUNT + 1))
+    NOT_READY_ITEMS+=("Perses")
+fi
 
 echo ""
-info "Kueue:"
-CQ_ACTIVE=$(oc get clusterqueue default \
-    -o jsonpath='{.status.conditions[?(@.type=="Active")].status}' 2>/dev/null || true)
-[ "$CQ_ACTIVE" = "True" ] && echo "  ✅ ClusterQueue default (Active)" || echo "  ⬚  ClusterQueue default"
-RF_COUNT=$(oc get resourceflavor --no-headers 2>/dev/null | wc -l | tr -d ' ')
-echo "  ✅ ResourceFlavors: $RF_COUNT"
-for NS in demo; do
-    LQ_ACTIVE=$(oc get localqueue default -n "$NS" \
-        -o jsonpath='{.status.conditions[?(@.type=="Active")].status}' 2>/dev/null || true)
-    [ "$LQ_ACTIVE" = "True" ] && echo "  ✅ LocalQueue default in $NS (Active)" || echo "  ⬚  LocalQueue default in $NS"
-done
+info "Operator CRs:"
+if oc get nodefeaturediscovery nfd-instance -n openshift-nfd &>/dev/null 2>&1; then
+    echo -e "  ${GREEN}[OK]${NC} NodeFeatureDiscovery"
+else
+    echo -e "  ${RED}[!!]${NC} NodeFeatureDiscovery"
+    NOT_READY_COUNT=$((NOT_READY_COUNT + 1))
+    NOT_READY_ITEMS+=("NodeFeatureDiscovery")
+fi
+CP_STATE=$(oc get clusterpolicy gpu-cluster-policy -o jsonpath='{.status.state}' 2>/dev/null || true)
+if [ "$CP_STATE" = "ready" ]; then
+    echo -e "  ${GREEN}[OK]${NC} ClusterPolicy (ready)"
+elif [ -n "$CP_STATE" ]; then
+    echo -e "  ${YELLOW}[..]${NC} ClusterPolicy ($CP_STATE)"
+else
+    echo -e "  ${RED}[!!]${NC} ClusterPolicy (not found)"
+    NOT_READY_COUNT=$((NOT_READY_COUNT + 1))
+    NOT_READY_ITEMS+=("ClusterPolicy")
+fi
+if [ -n "$CP_STATE" ]; then
+    if oc get servicemonitor nvidia-dcgm-exporter -n nvidia-gpu-operator &>/dev/null 2>&1; then
+        echo -e "  ${GREEN}[OK]${NC} DCGM exporter ServiceMonitor (cluster Prometheus)"
+    else
+        echo -e "  ${YELLOW}[..]${NC} DCGM exporter ServiceMonitor (not created yet)"
+    fi
+fi
+LWS_AVAILABLE=$(oc get leaderworkersetoperator cluster -n openshift-lws-operator \
+    -o jsonpath='{.status.conditions[?(@.type=="Available")].status}' 2>/dev/null || true)
+if [ "$LWS_AVAILABLE" = "True" ]; then
+    echo -e "  ${GREEN}[OK]${NC} LeaderWorkerSetOperator CR"
+else
+    echo -e "  ${RED}[!!]${NC} LeaderWorkerSetOperator CR"
+    NOT_READY_COUNT=$((NOT_READY_COUNT + 1))
+    NOT_READY_ITEMS+=("LeaderWorkerSetOperator CR")
+fi
+KUADRANT_READY=$(oc get kuadrant kuadrant -n kuadrant-system \
+    -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)
+if [ "$KUADRANT_READY" = "True" ]; then
+    echo -e "  ${GREEN}[OK]${NC} Kuadrant CR (Ready)"
+else
+    echo -e "  ${RED}[!!]${NC} Kuadrant CR (${KUADRANT_READY:-not found})"
+    NOT_READY_COUNT=$((NOT_READY_COUNT + 1))
+    NOT_READY_ITEMS+=("Kuadrant CR")
+fi
+AUTHORINO_TLS=$(oc get authorino authorino -n kuadrant-system \
+    -o jsonpath='{.spec.listener.tls.enabled}' 2>/dev/null || true)
+if [ "$AUTHORINO_TLS" = "true" ]; then
+    echo -e "  ${GREEN}[OK]${NC} Authorino TLS (enabled)"
+else
+    echo -e "  ${RED}[!!]${NC} Authorino TLS"
+    NOT_READY_COUNT=$((NOT_READY_COUNT + 1))
+    NOT_READY_ITEMS+=("Authorino TLS")
+fi
 
 echo ""
 info "Console Plugins:"
@@ -1718,60 +2064,79 @@ for PLUGIN_NAME in kuadrant-console-plugin console-dashboards-plugin monitoring-
     ENABLED_PLUGINS=$(oc get console.operator.openshift.io cluster \
         -o jsonpath='{.spec.plugins}' 2>/dev/null || echo "[]")
     if echo "$ENABLED_PLUGINS" | grep -q "$PLUGIN_NAME"; then
-        echo "  ✅ ${PLUGIN_NAME}"
+        echo -e "  ${GREEN}[OK]${NC} ${PLUGIN_NAME}"
     else
-        echo "  ⬚  ${PLUGIN_NAME}"
+        echo -e "  ${YELLOW}[..]${NC} ${PLUGIN_NAME} (not enabled)"
     fi
 done
 
 echo ""
-info "Operator CRs:"
-# Kuadrant CR (must be in kuadrant-system)
-KUADRANT_READY=$(oc get kuadrant kuadrant -n kuadrant-system \
-    -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)
-[ "$KUADRANT_READY" = "True" ] && echo "  ✅ Kuadrant CR (Ready in kuadrant-system)" || echo "  ⬚  Kuadrant CR (${KUADRANT_READY:-not found})"
-# Authorino TLS in kuadrant-system
-AUTHORINO_TLS=$(oc get authorino authorino -n kuadrant-system \
-    -o jsonpath='{.spec.listener.tls.enabled}' 2>/dev/null || true)
-[ "$AUTHORINO_TLS" = "true" ] && echo "  ✅ Authorino TLS (enabled)" || echo "  ⬚  Authorino TLS (${AUTHORINO_TLS:-not configured})"
-# LWS operator CR
-LWS_AVAILABLE=$(oc get leaderworkersetoperator cluster -n openshift-lws-operator \
-    -o jsonpath='{.status.conditions[?(@.type=="Available")].status}' 2>/dev/null || true)
-[ "$LWS_AVAILABLE" = "True" ] && echo "  ✅ LeaderWorkerSetOperator CR" || echo "  ⬚  LeaderWorkerSetOperator CR (${LWS_AVAILABLE:-not found})"
-
-echo ""
 info "Services:"
 MLFLOW_READY=$(oc get mlflow mlflow -o jsonpath='{.status.conditions[?(@.type=="Available")].status}' 2>/dev/null || true)
-[ "$MLFLOW_READY" = "True" ] && echo "  ✅ MLflow server" || echo "  ⬚  MLflow server"
+if [ "$MLFLOW_READY" = "True" ]; then
+    echo -e "  ${GREEN}[OK]${NC} MLflow server"
+else
+    echo -e "  ${RED}[!!]${NC} MLflow server"
+    NOT_READY_COUNT=$((NOT_READY_COUNT + 1))
+    NOT_READY_ITEMS+=("MLflow server")
+fi
 EVALHUB_PHASE=$(oc get evalhub evalhub -n redhat-ods-applications -o jsonpath='{.status.phase}' 2>/dev/null || true)
-[ "$EVALHUB_PHASE" = "Ready" ] && echo "  ✅ EvalHub" || echo "  ⬚  EvalHub (${EVALHUB_PHASE:-not deployed})"
+if [ "$EVALHUB_PHASE" = "Ready" ]; then
+    echo -e "  ${GREEN}[OK]${NC} EvalHub"
+else
+    echo -e "  ${RED}[!!]${NC} EvalHub (${EVALHUB_PHASE:-not deployed})"
+    NOT_READY_COUNT=$((NOT_READY_COUNT + 1))
+    NOT_READY_ITEMS+=("EvalHub")
+fi
+if oc get networkpolicy evalhub-allow-tenant-jobs -n redhat-ods-applications &>/dev/null; then
+    echo -e "  ${GREEN}[OK]${NC} EvalHub tenant NetworkPolicy"
+else
+    echo -e "  ${RED}[!!]${NC} EvalHub tenant NetworkPolicy (evalhub-allow-tenant-jobs)"
+    NOT_READY_COUNT=$((NOT_READY_COUNT + 1))
+    NOT_READY_ITEMS+=("EvalHub tenant NetworkPolicy")
+fi
+DS_PHASE=$(oc get checluster devspaces -n openshift-devspaces \
+    -o jsonpath='{.status.chePhase}' 2>/dev/null || true)
+if [ "$DS_PHASE" = "Active" ]; then
+    echo -e "  ${GREEN}[OK]${NC} CheCluster (Active)"
+else
+    echo -e "  ${YELLOW}[..]${NC} CheCluster (${DS_PHASE:-not found})"
+fi
 
 echo ""
 info "Gateway:"
 oc get gateway -n openshift-ingress --no-headers 2>/dev/null | while read name class addr rest; do
-    echo "  $name → $addr"
+    echo "  $name -> $addr"
 done
 
 echo ""
 info "Dashboard URL:"
 echo "  https://$(oc get route data-science-gateway -n redhat-ods-applications -o jsonpath='{.spec.host}' 2>/dev/null || echo '(check manually)')"
 
+# Total elapsed time
+SCRIPT_END=$(date +%s)
+TOTAL_SEC=$((SCRIPT_END - SCRIPT_START))
+TOTAL_MIN=$((TOTAL_SEC / 60))
+TOTAL_REMAINDER=$((TOTAL_SEC % 60))
+
 echo ""
 echo "=============================================="
-success "Done! Refresh the dashboard."
+if [ $NOT_READY_COUNT -eq 0 ]; then
+    success "All checks passed. Total time: ${TOTAL_MIN}m${TOTAL_REMAINDER}s"
+else
+    warn "${NOT_READY_COUNT} item(s) NOT READY. Total time: ${TOTAL_MIN}m${TOTAL_REMAINDER}s"
+    for item in "${NOT_READY_ITEMS[@]}"; do
+        echo -e "  ${RED}[!!]${NC} ${item}"
+    done
+    echo "  Re-run this script to pick up where it left off."
+fi
 echo ""
 echo "  Next steps:"
-echo "  • Deploy a model: Dashboard → Gen AI Studio → Deploy"
-echo "    - llm-d: LLMInferenceService (MaaS gateway, subscription/auth)"
+echo "  - MaaS setup: bash scripts/sno-setup-maas-35.sh"
 echo ""
-echo "  • MaaS setup: bash scripts/sno-setup-maas-35.sh"
+echo "  - Workshop prep: see scripts/workshop-prep/"
+echo "    create_workshop_users.sh      (htpasswd users + RBAC)"
+echo "    gpu_machineset_hardwareprofiles.sh (MachineSet + HardwareProfile)"
 echo ""
-echo "  • Workshop prep: see scripts/workshop-prep/"
-echo "    - create_workshop_users.sh    (htpasswd users + RBAC)"
-echo "    - gpu_machineset_hardwareprofiles.sh (MachineSet + HardwareProfile)"
-echo ""
-echo "  • DevSpaces dashboard: oc get checluster devspaces -n openshift-devspaces -o jsonpath='{.status.cheURL}'"
-echo ""
-echo "  • If some operators show ⬚, re-run this script."
-echo "    Operators installed by OLM continue in the background."
+echo "  - DevSpaces: oc get checluster devspaces -n openshift-devspaces -o jsonpath='{.status.cheURL}'"
 echo "=============================================="

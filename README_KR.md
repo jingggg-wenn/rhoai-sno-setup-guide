@@ -1,19 +1,19 @@
 # RHOAI 3.5 SNO 설정 가이드
 
 작성일: 29 Sep 2026
-최종 수정: 20 Oct 2026
+최종 수정: 26 Nov 2026
 
 Single Node OpenShift (SNO) 클러스터에서 Red Hat OpenShift AI 3.5의 모든 기능을 스크립트 하나로 활성화합니다. Models-as-a-Service (MaaS), 관측성(Observability), 평가 도구(Evaluation tooling)를 포함합니다.
 
 - **리포지토리:** [https://github.com/jingggg-wenn/rhoai-sno-setup-guide](https://github.com/jingggg-wenn/rhoai-sno-setup-guide)
 - **업스트림 소스:** [https://github.com/hyogrin/RHOAI-Toolkit](https://github.com/hyogrin/RHOAI-Toolkit) (`upstream` 리모트로 추적)
-- **테스트 환경:** RHOAI v3.5.1 (Sep 2026)
+- **테스트 환경:** RHOAI v3.5.2 (Nov 2026)
 
 ---
 
 ## 면책 조항
 
-이 설정 스크립트는 **비공식**이며, Red Hat에서 유지보수하거나 보증하지 않습니다. 특정 버전(현재 RHOAI 3.5.1) 기준으로 테스트 및 유지보수되며, 다른 버전에서는 수정 없이 작동하지 않을 수 있습니다. 사용 시 본인의 판단에 따라 진행하시기 바랍니다.
+이 설정 스크립트는 **비공식**이며, Red Hat에서 유지보수하거나 보증하지 않습니다. 특정 버전(현재 RHOAI 3.5.2) 기준으로 테스트 및 유지보수되며, 다른 버전에서는 수정 없이 작동하지 않을 수 있습니다. 사용 시 본인의 판단에 따라 진행하시기 바랍니다.
 
 ---
 
@@ -37,21 +37,24 @@ RHDP 데모 환경에는 GPU 노드가 이미 프로비저닝되어 있습니다
 
 ### 스크립트 1: `sno-enable-all-features-35.sh`
 
-RHOAI 3.5 DSC 컴포넌트 및 대시보드 기능을 활성화합니다:
+RHOAI 3.5 DSC 컴포넌트, 대시보드 기능 및 관련 오퍼레이터를 활성화합니다. 오퍼레이터를 먼저 설치한 후 DSCI/DSC를 구성합니다. 네트워크를 일시적으로 중단시킬 수 있는 RHCL은 모든 구성이 저장된 후 마지막에 설치합니다.
 
 | 단계 | 내용 |
 |------|------|
-| 1 | User Workload Monitoring |
-| 2 | DSC 컴포넌트 활성화 (MLflow, OGX, AIGateway, MaaS) |
-| 3 | MLflow 서버 + EvalHub + demo Data Science Project |
-| 4 | MaaS Gateway (GatewayClass + Gateway CR) |
-| 5 | 대시보드 메뉴 활성화 (모든 기능 플래그) |
-| 5b | Accelerator 메트릭 기록 규칙 (GPU Operator 전제 조건) |
-| 5c | Red Hat OpenShift Dev Spaces (오퍼레이터 + CheCluster) |
-| 6 | 오퍼레이터 설치 (Kueue, cert-manager, LWS, OpenTelemetry, Tempo, COO, RHCL) |
-| 7 | DSCI 관측성 (메트릭, 트레이스, MonitoringStack, Perses) + Kuadrant CR + UIPlugins |
-| 8 | 대시보드 재시작 |
-| 9 | 검증 |
+| 1 | 사전 요구 사항 확인 |
+| 2 | User Workload Monitoring |
+| 3a | 오퍼레이터 설치 (NFD, NVIDIA GPU, cert-manager, LWS, OpenTelemetry, Tempo, COO, Dev Spaces) + Web Terminal (이미 설치된 경우 건너뜀) |
+| 3b | 설치 후 CR 생성 (NodeFeatureDiscovery, ClusterPolicy, LWS, UIPlugins, CheCluster) |
+| 4 | DSCI merge patch (메트릭, 트레이스, MonitoringStack, Perses) |
+| 5 | DSC merge patch (모든 컴포넌트, Kueue 및 Trainer는 `Removed`로 설정) |
+| 6 | MLflow 서버 + EvalHub + demo Data Science Project |
+| 7 | MaaS Gateway (GatewayClass + Gateway CR) |
+| 8 | 대시보드 메뉴 활성화 (모든 기능 플래그) + Accelerator 메트릭 기록 규칙 |
+| 9 | RHCL 설치 + Kuadrant CR + Authorino TLS (Web Terminal 연결이 일시적으로 끊길 수 있음) |
+| 10 | 대시보드 재시작 |
+| 11 | 검증 (NOT READY 항목 표시) |
+
+> **참고:** Kueue는 더 이상 설치하지 않으며, Trainer 및 Training Jobs 대시보드 메뉴는 비활성화됩니다 (Trainer에 필요한 JobSet 오퍼레이터를 설치하지 않기 때문입니다).
 
 ### 스크립트 2: `sno-setup-maas-35.sh`
 
@@ -123,7 +126,7 @@ Web Terminal(또는 `oc login`이 완료된 터미널)에서:
 curl -sL https://raw.githubusercontent.com/jingggg-wenn/rhoai-sno-setup-guide/main/scripts/sno-enable-all-features-35.sh | bash
 ```
 
-> **참고:** Web Terminal에서 RHCL/Service Mesh 설치(6단계) 시 세션이 일시적으로 끊길 수 있습니다. 이 경우 OLM이 백그라운드에서 오퍼레이터 설치를 계속 진행합니다. 재접속 후 스크립트를 다시 실행하면 완료된 단계는 건너뜁니다.
+> **참고:** Web Terminal에서 RHCL/Service Mesh 설치(9단계) 시 세션이 일시적으로 끊길 수 있습니다. 이 경우 OLM이 백그라운드에서 오퍼레이터 설치를 계속 진행합니다. 재접속 후 스크립트를 다시 실행하면 완료된 단계는 건너뜁니다.
 
 > **실행 결과 예시:** [sno-all-features-output.txt](sample-output/sno-all-features-output.txt)
 
@@ -186,7 +189,7 @@ curl -sk https://maas.${CLUSTER_DOMAIN}/v1/models -H "Authorization: Bearer $TOK
 
 ---
 
-## 알려진 이슈 (RHOAI 3.5.1)
+## 알려진 이슈 (RHOAI 3.5.2)
 
 - **MaaS 게이트웨이를 통한 비스트리밍 chat/completions** 요청 시 빈 응답(0바이트)이 반환될 수 있습니다. 이는 `ext_proc` 필터의 `FULL_DUPLEX_STREAMED` 응답 본문 모드가 단일 본문(비스트리밍) 응답과 충돌하기 때문입니다. 스트리밍(`stream: true`)은 정상 작동합니다. Playground는 기본적으로 스트리밍을 사용하므로 영향을 받지 않습니다.
 
@@ -202,7 +205,7 @@ oc get csv -n redhat-ods-operator
 oc get datasciencecluster default-dsc
 
 # 설치된 오퍼레이터
-oc get csv -A | grep -E "nfd|gpu|kueue|lws|rhcl|rhods|cert-manager|tempo|opentelemetry|observability"
+oc get csv -A | grep -E "nfd|gpu|lws|rhcl|rhods|cert-manager|tempo|opentelemetry|observability|devspaces|web-terminal"
 
 # MaaS 게이트웨이
 oc get gateway -n openshift-ingress
